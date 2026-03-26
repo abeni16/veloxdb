@@ -1,11 +1,31 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { createColumnHelper, getCoreRowModel, useReactTable, type RowSelectionState } from '@tanstack/react-table'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent,
+} from 'react'
+import {
+  createColumnHelper,
+  flexRender,
+  getCoreRowModel,
+  useReactTable,
+  type Cell,
+  type RowSelectionState,
+} from '@tanstack/react-table'
 import { useVirtualizer } from '@tanstack/react-virtual'
 
 import type { QueryResult } from '@/data/types'
 import { ResultsToolbar } from '@/features/queries/components/ResultsToolbar'
 import { copyRows, downloadRowsAsCsv, downloadRowsAsJson } from '@/features/queries/results-export'
 import type { ResultEditPatch, ResultRow } from '@/features/queries/result-edits'
+
+const SELECT_COLUMN_WIDTH_PX = 44
+const DEFAULT_DATA_COLUMN_WIDTH_PX = 180
+const MIN_COLUMN_WIDTH_PX = 48
+const MAX_COLUMN_WIDTH_PX = 640
 
 type ResultsGridProps = {
   result: QueryResult | null
@@ -33,6 +53,52 @@ function formatValue(value: string | null | undefined) {
 
 function toEditableValue(value: string | null | undefined) {
   return value ?? ''
+}
+
+function ResultEditInput({
+  defaultValue,
+  onBlurCommit,
+  onEscape,
+}: {
+  defaultValue: string
+  onBlurCommit: (raw: string) => void
+  onEscape: () => void
+}) {
+  const inputRef = useRef<HTMLInputElement>(null)
+  const skipBlurCommitRef = useRef(false)
+
+  useLayoutEffect(() => {
+    const element = inputRef.current
+    if (!element) {
+      return
+    }
+    element.focus()
+    element.select()
+  }, [])
+
+  return (
+    <input
+      ref={inputRef}
+      className="h-6 w-full min-w-0 border border-border bg-background px-1 text-xs outline-none focus:border-ring"
+      defaultValue={defaultValue}
+      onBlur={(event) => {
+        if (skipBlurCommitRef.current) {
+          skipBlurCommitRef.current = false
+          return
+        }
+        onBlurCommit(event.target.value)
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') {
+          event.currentTarget.blur()
+        }
+        if (event.key === 'Escape') {
+          skipBlurCommitRef.current = true
+          onEscape()
+        }
+      }}
+    />
+  )
 }
 
 function renderLoadingSkeleton() {
@@ -83,6 +149,7 @@ export function ResultsGrid({
   const parentRef = useRef<HTMLDivElement | null>(null)
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({})
   const [columnVisibility, setColumnVisibility] = useState<Record<string, boolean>>({})
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>({})
   const [pendingEdits, setPendingEdits] = useState<Record<string, Record<string, string | null>>>({})
   const [editingCell, setEditingCell] = useState<{ rowId: string; columnId: string } | null>(null)
 
@@ -133,13 +200,6 @@ export function ResultsGrid({
       }),
     [indexedRows, pendingEdits],
   )
-  const resultSignature = useMemo(() => {
-    if (!result) {
-      return 'no-result'
-    }
-    return `${result.executionMs}:${result.rowCount}:${result.columns.join('|')}`
-  }, [result])
-
   const columnHelper = createColumnHelper<ResultRow>()
   const columnDefs = useMemo(
     () => [
@@ -170,7 +230,7 @@ export function ResultsGrid({
 
             if (!isColumnEditable) {
               return (
-                <span className={value === null ? 'text-muted-foreground' : ''}>
+                <span className={`block min-w-0 truncate ${value === null ? 'text-muted-foreground' : ''}`}>
                   {formatValue(value)}
                 </span>
               )
@@ -178,11 +238,11 @@ export function ResultsGrid({
 
             if (isCellEditing) {
               return (
-                <input
-                  className="h-6 w-full border border-border bg-background px-1 text-xs outline-none focus:border-ring"
+                <ResultEditInput
                   defaultValue={toEditableValue(value)}
-                  onBlur={(event) => {
-                    const nextValue = event.target.value === '' ? null : event.target.value
+                  onEscape={() => setEditingCell(null)}
+                  onBlurCommit={(raw) => {
+                    const nextValue = raw === '' ? null : raw
                     const originalValue = originalByRowId[rowId]?.[columnId] ?? null
 
                     setPendingEdits((current) => {
@@ -205,14 +265,6 @@ export function ResultsGrid({
                     })
                     setEditingCell(null)
                   }}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
-                      event.currentTarget.blur()
-                    }
-                    if (event.key === 'Escape') {
-                      setEditingCell(null)
-                    }
-                  }}
                 />
               )
             }
@@ -220,9 +272,9 @@ export function ResultsGrid({
             return (
               <button
                 type="button"
-                className={`w-full truncate text-left ${value === null ? 'text-muted-foreground' : ''}`}
-                title="Double click to edit"
-                onDoubleClick={() => setEditingCell({ rowId, columnId })}
+                className={`w-full min-w-0 truncate text-left ${value === null ? 'text-muted-foreground' : ''}`}
+                title="Click to edit"
+                onClick={() => setEditingCell({ rowId, columnId })}
               >
                 {formatValue(value)}
               </button>
@@ -258,17 +310,75 @@ export function ResultsGrid({
   })
 
   const visibleColumns = table.getVisibleLeafColumns()
+
+  const getColumnWidthPx = useCallback(
+    (columnId: string) =>
+      columnWidths[columnId] ??
+      (columnId === '__select' ? SELECT_COLUMN_WIDTH_PX : DEFAULT_DATA_COLUMN_WIDTH_PX),
+    [columnWidths],
+  )
+
   const templateColumns =
     visibleColumns.length > 0
-      ? `repeat(${visibleColumns.length}, minmax(180px, 1fr))`
+      ? visibleColumns.map((column) => `${getColumnWidthPx(column.id)}px`).join(' ')
       : 'minmax(0, 1fr)'
+
+  const handleColumnResizePointerDown = useCallback(
+    (columnId: string, event: PointerEvent<HTMLElement>) => {
+      event.preventDefault()
+      event.stopPropagation()
+      const startX = event.clientX
+      const startWidth = getColumnWidthPx(columnId)
+
+      const clampWidth = (value: number) =>
+        Math.min(MAX_COLUMN_WIDTH_PX, Math.max(MIN_COLUMN_WIDTH_PX, value))
+
+      const onPointerMove = (moveEvent: globalThis.PointerEvent) => {
+        const delta = moveEvent.clientX - startX
+        const nextWidth = clampWidth(startWidth + delta)
+        setColumnWidths((current) => ({ ...current, [columnId]: nextWidth }))
+      }
+
+      const onPointerUp = () => {
+        window.removeEventListener('pointermove', onPointerMove)
+        window.removeEventListener('pointerup', onPointerUp)
+        window.removeEventListener('pointercancel', onPointerUp)
+      }
+
+      window.addEventListener('pointermove', onPointerMove)
+      window.addEventListener('pointerup', onPointerUp)
+      window.addEventListener('pointercancel', onPointerUp)
+    },
+    [getColumnWidthPx],
+  )
+
+  const renderBodyCell = useCallback((cell: Cell<ResultRow, unknown>) => {
+    const cellDef = cell.column.columnDef.cell
+    if (cellDef) {
+      return flexRender(cellDef, cell.getContext())
+    }
+    return formatValue(cell.getValue() as string | null)
+  }, [])
+
   const hasEdits = Object.keys(pendingEdits).length > 0
+
+  useEffect(() => {
+    setColumnWidths((previous) => {
+      const identifiers = ['__select', ...columns]
+      const next: Record<string, number> = {}
+      for (const id of identifiers) {
+        const fallback = id === '__select' ? SELECT_COLUMN_WIDTH_PX : DEFAULT_DATA_COLUMN_WIDTH_PX
+        next[id] = previous[id] ?? fallback
+      }
+      return next
+    })
+  }, [columns])
 
   useEffect(() => {
     setPendingEdits({})
     setRowSelection({})
     setEditingCell(null)
-  }, [resultSignature])
+  }, [result])
 
   const handleSave = async () => {
     if (!onSaveEdits) {
@@ -373,52 +483,64 @@ export function ResultsGrid({
           void handleSave()
         }}
       />
-      <div className="grid border-b border-border bg-muted/30" style={{ gridTemplateColumns: templateColumns }}>
-        {visibleColumns.map((column) => (
-          <div
-            key={column.id}
-            className="truncate border-r border-border px-3 py-2 text-[11px] font-medium uppercase tracking-[0.18em] text-muted-foreground last:border-r-0"
-          >
-            {column.id}
-          </div>
-        ))}
-      </div>
-
-      <div ref={parentRef} className="min-h-0 flex-1 overflow-auto">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-auto">
         <div
-          className="relative w-full"
-          style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
+          className="grid w-max min-w-full shrink-0 border-b border-border bg-muted/30"
+          style={{ gridTemplateColumns: templateColumns }}
         >
-          {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-            const row = table.getRowModel().rows[virtualRow.index]
-            if (!row) {
-              return null
-            }
+          {visibleColumns.map((column) => (
+            <div
+              key={column.id}
+              className="relative min-w-0 truncate border-r border-border px-3 py-2 pr-2 text-[11px] font-medium uppercase tracking-[0.18em] text-muted-foreground last:border-r-0"
+            >
+              <span className="block truncate">{column.id === '__select' ? 'Select' : column.id}</span>
+              <button
+                type="button"
+                tabIndex={-1}
+                aria-label={`Resize column ${column.id === '__select' ? 'Select' : column.id}`}
+                className="absolute right-0 top-0 z-10 h-full w-2 cursor-col-resize select-none border-0 bg-transparent p-0 hover:bg-primary/20"
+                onPointerDown={(event) => handleColumnResizePointerDown(column.id, event)}
+              />
+            </div>
+          ))}
+        </div>
 
-            return (
-              <div
-                key={row.id}
-                className={`absolute left-0 top-0 grid w-full border-b border-border/60 text-xs ${
-                  row.getIsSelected() ? 'bg-muted/40' : 'bg-background'
-                }`}
-                style={{
-                  height: `${virtualRow.size}px`,
-                  transform: `translateY(${virtualRow.start}px)`,
-                  gridTemplateColumns: templateColumns,
-                }}
-              >
-                {row.getVisibleCells().map((cell) => (
-                  <div
-                    key={cell.id}
-                    className="truncate border-r border-border/60 px-3 py-2 last:border-r-0"
-                    title={formatValue(cell.getValue() as string | null)}
-                  >
-                    {cell.renderValue() as string}
-                  </div>
-                ))}
-              </div>
-            )
-          })}
+        <div ref={parentRef} className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
+          <div
+            className="relative w-max min-w-full"
+            style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
+          >
+            {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+              const row = table.getRowModel().rows[virtualRow.index]
+              if (!row) {
+                return null
+              }
+
+              return (
+                <div
+                  key={row.id}
+                  className={`absolute left-0 top-0 grid w-max min-w-full border-b border-border/60 text-xs ${
+                    row.getIsSelected() ? 'bg-muted/40' : 'bg-background'
+                  }`}
+                  style={{
+                    height: `${virtualRow.size}px`,
+                    transform: `translateY(${virtualRow.start}px)`,
+                    gridTemplateColumns: templateColumns,
+                  }}
+                >
+                  {row.getVisibleCells().map((cell) => (
+                    <div
+                      key={cell.id}
+                      className="min-w-0 truncate border-r border-border/60 px-3 py-2 last:border-r-0"
+                      title={formatValue(cell.getValue() as string | null)}
+                    >
+                      {renderBodyCell(cell)}
+                    </div>
+                  ))}
+                </div>
+              )
+            })}
+          </div>
         </div>
       </div>
       <div className="border-t border-border bg-muted/10 px-3 py-1.5 text-[11px] text-muted-foreground">
