@@ -10,7 +10,6 @@ const HEADER_H = 40
 const ROW_H = 18
 const MAX_ROWS = 8
 const PAD = 10
-const CORNER = 12
 
 type TableNodeProps = {
   x: number
@@ -20,6 +19,9 @@ type TableNodeProps = {
   columns: ColumnInfo[] | null
   selected: boolean
   palette: KonvaPalette
+  /** When true, node is not draggable; used with Space-held canvas pan. */
+  spaceHeld?: boolean
+  onBeginCanvasPan?: (clientX: number, clientY: number) => void
   onSelect: () => void
   onDragEnd: (x: number, y: number) => void
   onRequestColumns: () => void
@@ -33,6 +35,8 @@ export function TableNode({
   columns,
   selected,
   palette,
+  spaceHeld = false,
+  onBeginCanvasPan,
   onSelect,
   onDragEnd,
   onRequestColumns,
@@ -51,9 +55,14 @@ export function TableNode({
     <Group
       x={x}
       y={y}
-      draggable
-      dragDistance={6}
+      draggable={!spaceHeld}
+      dragDistance={8}
       onMouseDown={(e) => {
+        if (spaceHeld && onBeginCanvasPan && e.evt.button === 0) {
+          onBeginCanvasPan(e.evt.clientX, e.evt.clientY)
+          e.cancelBubble = true
+          return
+        }
         e.cancelBubble = true
         onSelect()
       }}
@@ -72,7 +81,7 @@ export function TableNode({
       <Rect
         width={NODE_WIDTH}
         height={height}
-        cornerRadius={CORNER}
+        cornerRadius={palette.cornerRadiusPx}
         fillLinearGradientStartPoint={{ x: 0, y: 0 }}
         fillLinearGradientEndPoint={{ x: 0, y: height }}
         fillLinearGradientColorStops={[
@@ -88,8 +97,8 @@ export function TableNode({
         stroke={stroke}
         strokeWidth={strokeW}
         shadowColor={palette.shadow}
-        shadowBlur={selected ? 18 : 14}
-        shadowOffset={{ x: 0, y: selected ? 6 : 4 }}
+        shadowBlur={selected ? 10 : 8}
+        shadowOffset={{ x: 0, y: selected ? 3 : 2 }}
         shadowOpacity={1}
         listening={false}
         perfectDrawEnabled={false}

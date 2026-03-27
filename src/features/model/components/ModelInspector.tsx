@@ -1,11 +1,24 @@
-import { useMemo } from 'react'
-import { SpinnerGapIcon, CheckIcon } from '@phosphor-icons/react'
+import { useMemo, useState } from 'react'
+import { SpinnerGapIcon, CheckIcon, TrashIcon } from '@phosphor-icons/react'
 
+import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { ColumnProperties, TableInfo } from '@/data/types'
-import type { ColumnOverride, TableIdentityDraft } from '@/features/model/apply-entire-model'
+import type {
+  ColumnOverride,
+  PendingModelColumn,
+  PendingModelForeignKey,
+  TableIdentityDraft,
+} from '@/features/model/apply-entire-model'
+import { tableKey, type TableKey } from '@/features/model/model-types'
 import { useTablePropertiesQuery } from '@/features/schema/queries'
-import type { TableKey } from '@/features/model/model-types'
+
+type PendingFkInput = {
+  fromColumn: string
+  toKey: TableKey
+  toColumn: string
+  constraintName?: string
+}
 
 type ModelInspectorProps = {
   connectionId: string
@@ -15,6 +28,12 @@ type ModelInspectorProps = {
   onIdentityDraftChange: (next: TableIdentityDraft) => void
   columnOverrides: Record<string, ColumnOverride>
   onColumnOverridesChange: (next: Record<string, ColumnOverride>) => void
+  catalogTables: TableInfo[]
+  pendingAddColumns: PendingModelColumn[]
+  onPendingAddColumnsChange: (next: PendingModelColumn[]) => void
+  pendingForeignKeys: PendingModelForeignKey[]
+  onAddPendingForeignKey: (row: PendingFkInput) => void
+  onRemovePendingForeignKey: (id: string) => void
 }
 
 function ToggleButton({
@@ -45,6 +64,9 @@ function formatConstraintHint(column: ColumnProperties) {
   return undefined
 }
 
+const selectClass =
+  'h-8 w-full min-w-0 border border-input bg-transparent px-2 text-xs text-foreground outline-none focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/50 dark:bg-input/30'
+
 export function ModelInspector({
   connectionId,
   table,
@@ -53,11 +75,38 @@ export function ModelInspector({
   onIdentityDraftChange,
   columnOverrides,
   onColumnOverridesChange,
+  catalogTables,
+  pendingAddColumns,
+  onPendingAddColumnsChange,
+  pendingForeignKeys,
+  onAddPendingForeignKey,
+  onRemovePendingForeignKey,
 }: ModelInspectorProps) {
   const propertiesQuery = useTablePropertiesQuery({
     connectionId,
     table,
     enabled: Boolean(connectionId && table),
+  })
+
+  const [newColName, setNewColName] = useState('')
+  const [newColType, setNewColType] = useState('integer')
+  const [newColNullable, setNewColNullable] = useState(true)
+  const [newColDefault, setNewColDefault] = useState('')
+
+  const [fkFromColumn, setFkFromColumn] = useState('')
+  const [fkToKey, setFkToKey] = useState<TableKey>('')
+  const [fkToColumn, setFkToColumn] = useState('')
+  const [fkConstraintName, setFkConstraintName] = useState('')
+
+  const fkTargetTable = useMemo(() => {
+    if (!fkToKey) return null
+    return catalogTables.find((t) => tableKey(t) === fkToKey) ?? null
+  }, [catalogTables, fkToKey])
+
+  const fkTargetPropsQuery = useTablePropertiesQuery({
+    connectionId,
+    table: fkTargetTable,
+    enabled: Boolean(connectionId && fkTargetTable),
   })
 
   const columns = propertiesQuery.data ?? []
@@ -70,6 +119,52 @@ export function ModelInspector({
     }
     return { ...base, ...columnOverrides }
   }, [propertiesQuery.data, columnOverrides])
+
+  const pendingFksHere = useMemo(
+    () => pendingForeignKeys.filter((fk) => fk.fromKey === tableKeyStr),
+    [pendingForeignKeys, tableKeyStr],
+  )
+
+  const existingColumnNames = useMemo(() => {
+    const s = new Set<string>()
+    for (const c of propertiesQuery.data ?? []) s.add(c.columnName)
+    for (const p of pendingAddColumns) s.add(p.columnName.trim())
+    return s
+  }, [propertiesQuery.data, pendingAddColumns])
+
+  const pushPendingColumn = () => {
+    const name = newColName.trim()
+    const dataType = newColType.trim()
+    if (!name || !dataType) return
+    if (existingColumnNames.has(name)) return
+    onPendingAddColumnsChange([
+      ...pendingAddColumns,
+      {
+        id: crypto.randomUUID(),
+        columnName: name,
+        dataType,
+        nullable: newColNullable,
+        defaultSql: newColDefault.trim() || undefined,
+      },
+    ])
+    setNewColName('')
+    setNewColDefault('')
+  }
+
+  const pushPendingFk = () => {
+    if (!tableKeyStr || !fkFromColumn || !fkToKey || !fkToColumn) return
+    if (fkToKey === tableKeyStr) return
+    onAddPendingForeignKey({
+      fromColumn: fkFromColumn,
+      toKey: fkToKey,
+      toColumn: fkToColumn,
+      constraintName: fkConstraintName.trim() || undefined,
+    })
+    setFkFromColumn('')
+    setFkToKey('')
+    setFkToColumn('')
+    setFkConstraintName('')
+  }
 
   if (!table || !identityDraft) {
     return (
@@ -114,6 +209,183 @@ export function ModelInspector({
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto px-3 py-2">
+        <div className="mb-4 space-y-2 border-b border-border pb-4">
+          <p className="text-[10px] font-medium text-muted-foreground">Add column (pending)</p>
+          <p className="text-[10px] leading-snug text-muted-foreground">
+            Applied with <span className="font-medium text-foreground">Apply entire model</span> as{' '}
+            <code className="text-foreground/90">ALTER TABLE … ADD COLUMN</code>. Type is a PostgreSQL type
+            fragment (not quoted).
+          </p>
+          <div className="grid gap-2">
+            <Input
+              className="h-8 text-xs"
+              placeholder="Column name"
+              value={newColName}
+              onChange={(e) => setNewColName(e.target.value)}
+              spellCheck={false}
+            />
+            <Input
+              className="h-8 text-xs"
+              placeholder="Type, e.g. text, integer, timestamptz"
+              value={newColType}
+              onChange={(e) => setNewColType(e.target.value)}
+              spellCheck={false}
+            />
+            <Input
+              className="h-8 text-xs"
+              placeholder="DEFAULT expression (optional)"
+              value={newColDefault}
+              onChange={(e) => setNewColDefault(e.target.value)}
+              spellCheck={false}
+            />
+            <label className="flex items-center gap-2 text-[10px] text-muted-foreground">
+              <ToggleButton checked={newColNullable} onClick={() => setNewColNullable((v) => !v)} />
+              Nullable
+            </label>
+            <Button
+              type="button"
+              size="sm"
+              className="h-8 w-full text-xs"
+              disabled={!newColName.trim() || !newColType.trim() || existingColumnNames.has(newColName.trim())}
+              onClick={pushPendingColumn}
+            >
+              Queue column
+            </Button>
+          </div>
+          {pendingAddColumns.length > 0 ? (
+            <ul className="mt-2 space-y-1.5 text-[10px]">
+              {pendingAddColumns.map((p) => (
+                <li
+                  key={p.id}
+                  className="flex items-start justify-between gap-2 border border-border/60 bg-muted/20 px-2 py-1.5"
+                >
+                  <span className="min-w-0 break-all font-mono text-foreground/90">
+                    {p.columnName} {p.dataType}
+                    {!p.nullable ? ' NOT NULL' : ''}
+                    {p.defaultSql ? ` DEFAULT ${p.defaultSql}` : ''}
+                  </span>
+                  <button
+                    type="button"
+                    className="shrink-0 text-muted-foreground transition hover:text-destructive"
+                    aria-label={`Remove ${p.columnName}`}
+                    onClick={() => onPendingAddColumnsChange(pendingAddColumns.filter((x) => x.id !== p.id))}
+                  >
+                    <TrashIcon className="size-3.5" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+
+        <div className="mb-4 space-y-2 border-b border-border pb-4">
+          <p className="text-[10px] font-medium text-muted-foreground">Add foreign key (pending)</p>
+          <p className="text-[10px] leading-snug text-muted-foreground">
+            Single-column FK. Runs as <code className="text-foreground/90">ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY</code>
+            .
+          </p>
+          <div className="grid gap-2">
+            <label className="text-[10px] text-muted-foreground" htmlFor="fk-from-col">
+              From column (this table)
+            </label>
+            <select
+              id="fk-from-col"
+              className={selectClass}
+              value={fkFromColumn}
+              onChange={(e) => setFkFromColumn(e.target.value)}
+            >
+              <option value="">Select column…</option>
+              {pendingAddColumns.map((p) => (
+                <option key={p.id} value={p.columnName.trim()}>
+                  {p.columnName} (pending)
+                </option>
+              ))}
+              {columns.map((c) => (
+                <option key={c.columnName} value={c.columnName}>
+                  {c.columnName}
+                </option>
+              ))}
+            </select>
+            <label className="text-[10px] text-muted-foreground" htmlFor="fk-to-table">
+              Referenced table
+            </label>
+            <select
+              id="fk-to-table"
+              className={selectClass}
+              value={fkToKey}
+              onChange={(e) => {
+                setFkToKey(e.target.value as TableKey)
+                setFkToColumn('')
+              }}
+            >
+              <option value="">Select table…</option>
+              {catalogTables.map((t) => {
+                const k = tableKey(t)
+                return (
+                  <option key={k} value={k} disabled={k === tableKeyStr}>
+                    {k}
+                  </option>
+                )
+              })}
+            </select>
+            <label className="text-[10px] text-muted-foreground" htmlFor="fk-to-col">
+              Referenced column
+            </label>
+            <select
+              id="fk-to-col"
+              className={selectClass}
+              value={fkToColumn}
+              onChange={(e) => setFkToColumn(e.target.value)}
+              disabled={!fkToKey}
+            >
+              <option value="">Select column…</option>
+              {(fkTargetPropsQuery.data ?? []).map((c) => (
+                <option key={c.columnName} value={c.columnName}>
+                  {c.columnName}
+                </option>
+              ))}
+            </select>
+            <Input
+              className="h-8 text-xs"
+              placeholder="Constraint name (optional)"
+              value={fkConstraintName}
+              onChange={(e) => setFkConstraintName(e.target.value)}
+              spellCheck={false}
+            />
+            <Button
+              type="button"
+              size="sm"
+              className="h-8 w-full text-xs"
+              disabled={!fkFromColumn || !fkToKey || !fkToColumn || fkToKey === tableKeyStr}
+              onClick={pushPendingFk}
+            >
+              Queue foreign key
+            </Button>
+          </div>
+          {pendingFksHere.length > 0 ? (
+            <ul className="mt-2 space-y-1.5 text-[10px]">
+              {pendingFksHere.map((fk) => (
+                <li
+                  key={fk.id}
+                  className="flex items-start justify-between gap-2 border border-border/60 bg-muted/20 px-2 py-1.5"
+                >
+                  <span className="min-w-0 break-all text-foreground/90">
+                    {fk.fromColumn} → {fk.toKey} ({fk.toColumn})
+                  </span>
+                  <button
+                    type="button"
+                    className="shrink-0 text-muted-foreground transition hover:text-destructive"
+                    aria-label="Remove foreign key"
+                    onClick={() => onRemovePendingForeignKey(fk.id)}
+                  >
+                    <TrashIcon className="size-3.5" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+
         {propertiesQuery.isLoading ? (
           <div className="flex items-center justify-center gap-2 py-8 text-xs text-muted-foreground">
             <SpinnerGapIcon className="size-4 animate-spin" />
@@ -133,6 +405,7 @@ export function ModelInspector({
 
         {propertiesQuery.isSuccess && columns.length > 0 ? (
           <div className="divide-y divide-border">
+            <p className="pb-2 text-[10px] font-medium text-muted-foreground">Existing columns</p>
             {columns.map((col) => {
               const d = draft[col.columnName] ?? {
                 isNullable: col.isNullable,
@@ -197,7 +470,7 @@ export function ModelInspector({
 
       <div className="shrink-0 border-t border-border px-3 py-2 text-[10px] text-muted-foreground">
         Use <span className="font-medium text-foreground">Apply entire model</span> in the toolbar to persist all
-        inspector changes.
+        inspector changes, queued columns, and queued foreign keys.
       </div>
     </div>
   )

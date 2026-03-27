@@ -12,13 +12,15 @@ export type KonvaPalette = {
   mutedForeground: string
   edge: string
   shadow: string
+  /** Resolved from CSS `--radius` for Konva rects */
+  cornerRadiusPx: number
 }
 
 export function readKonvaPalette(isDark: boolean): KonvaPalette {
   const base = readKonvaPaletteFromDom()
   return {
     ...base,
-    shadow: isDark ? 'rgba(0, 0, 0, 0.55)' : 'rgba(15, 23, 42, 0.14)',
+    shadow: isDark ? 'rgba(0, 0, 0, 0.4)' : 'rgba(15, 23, 42, 0.1)',
   }
 }
 
@@ -38,6 +40,18 @@ function readColorVar(root: HTMLElement, property: 'color' | 'backgroundColor', 
   return resolved && resolved !== 'rgba(0, 0, 0, 0)' ? resolved : 'rgb(128, 128, 128)'
 }
 
+function readCornerRadiusPx(root: HTMLElement): number {
+  const el = document.createElement('div')
+  el.style.position = 'fixed'
+  el.style.left = '-9999px'
+  el.style.top = '0'
+  el.style.borderRadius = 'var(--radius)'
+  root.appendChild(el)
+  const px = parseFloat(getComputedStyle(el).borderTopLeftRadius) || 0
+  root.removeChild(el)
+  return px
+}
+
 function readKonvaPaletteFromDom(): Omit<KonvaPalette, 'shadow'> {
   const root = document.documentElement
   return {
@@ -49,5 +63,6 @@ function readKonvaPaletteFromDom(): Omit<KonvaPalette, 'shadow'> {
     foreground: readColorVar(root, 'color', '--card-foreground'),
     mutedForeground: readColorVar(root, 'color', '--muted-foreground'),
     edge: readColorVar(root, 'backgroundColor', '--sidebar-border'),
+    cornerRadiusPx: readCornerRadiusPx(root),
   }
 }

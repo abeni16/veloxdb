@@ -46,6 +46,7 @@ export function DiagramCanvas({
 }: DiagramCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [size, setSize] = useState({ w: 640, h: 480 })
+  const [spaceHeld, setSpaceHeld] = useState(false)
   const palette = useMemo(() => readKonvaPalette(isDark), [isDark])
   const panRef = useRef<{ sx: number; sy: number; vx: number; vy: number; scale: number } | null>(null)
 
@@ -77,29 +78,61 @@ export function DiagramCanvas({
     return () => el.removeEventListener('wheel', onWheel)
   }, [])
 
-  const onCanvasSet = new Set(tableDisplays.map((t) => t.key))
+  useEffect(() => {
+    const tagIgnores = new Set(['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'])
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || e.repeat) return
+      const t = e.target as HTMLElement | null
+      if (t?.isContentEditable || (t && tagIgnores.has(t.tagName))) return
+      e.preventDefault()
+      setSpaceHeld(true)
+    }
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'Space') setSpaceHeld(false)
+    }
+    const onBlurWindow = () => setSpaceHeld(false)
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keyup', onKeyUp)
+    window.addEventListener('blur', onBlurWindow)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keyup', onKeyUp)
+      window.removeEventListener('blur', onBlurWindow)
+    }
+  }, [])
 
-  const edgeSegments = foreignKeys.flatMap((fk) => {
-    const fromKey = `${fk.fromSchema}.${fk.fromTable}`
-    const toKey = `${fk.toSchema}.${fk.toTable}`
-    if (!onCanvasSet.has(fromKey) || !onCanvasSet.has(toKey)) return []
+  const onCanvasSet = useMemo(() => new Set(tableDisplays.map((t) => t.key)), [tableDisplays])
 
-    const fromPos = positions[fromKey]
-    const toPos = positions[toKey]
-    if (!fromPos || !toPos) return []
+  const edgeSegments = useMemo(() => {
+    const seen = new Set<string>()
+    const out: number[][] = []
+    for (const fk of foreignKeys) {
+      const fromKey = `${fk.fromSchema}.${fk.fromTable}`
+      const toKey = `${fk.toSchema}.${fk.toTable}`
+      if (!onCanvasSet.has(fromKey) || !onCanvasSet.has(toKey)) continue
 
-    const fromCols = columnsByKey[fromKey] ?? null
-    const toCols = columnsByKey[toKey] ?? null
-    const h0 = tableNodeHeight(fromCols)
-    const h1 = tableNodeHeight(toCols)
+      const dedupeKey = `${fromKey}\0${toKey}`
+      if (seen.has(dedupeKey)) continue
+      seen.add(dedupeKey)
 
-    const x0 = fromPos.x + TABLE_NODE_WIDTH / 2
-    const y0 = fromPos.y + h0 / 2
-    const x1 = toPos.x + TABLE_NODE_WIDTH / 2
-    const y1 = toPos.y + h1 / 2
+      const fromPos = positions[fromKey]
+      const toPos = positions[toKey]
+      if (!fromPos || !toPos) continue
 
-    return [[x0, y0, x1, y1] as number[]]
-  })
+      const fromCols = columnsByKey[fromKey] ?? null
+      const toCols = columnsByKey[toKey] ?? null
+      const h0 = tableNodeHeight(fromCols)
+      const h1 = tableNodeHeight(toCols)
+
+      const x0 = fromPos.x + TABLE_NODE_WIDTH / 2
+      const y0 = fromPos.y + h0 / 2
+      const x1 = toPos.x + TABLE_NODE_WIDTH / 2
+      const y1 = toPos.y + h1 / 2
+
+      out.push([x0, y0, x1, y1])
+    }
+    return out
+  }, [columnsByKey, foreignKeys, onCanvasSet, positions])
 
   const handleWheel = useCallback(
     (e: KonvaEventObject<WheelEvent>) => {
@@ -147,11 +180,11 @@ export function DiagramCanvas({
     (e: KonvaEventObject<MouseEvent>) => {
       if (e.target !== e.currentTarget) return
       if (e.evt.button === 0) {
-        onSelectKey(null)
+        if (!spaceHeld) onSelectKey(null)
         beginPan(e.evt.clientX, e.evt.clientY)
       }
     },
-    [beginPan, onSelectKey],
+    [beginPan, onSelectKey, spaceHeld],
   )
 
   const onStageMouseDown = useCallback(
@@ -161,12 +194,23 @@ export function DiagramCanvas({
         return
       }
       const stage = e.target.getStage()
+      if (e.evt.button === 0 && spaceHeld) {
+        beginPan(e.evt.clientX, e.evt.clientY)
+        return
+      }
       if (e.evt.button === 0 && e.target === stage) {
         onSelectKey(null)
         beginPan(e.evt.clientX, e.evt.clientY)
       }
     },
-    [beginPan, onSelectKey],
+    [beginPan, onSelectKey, spaceHeld],
+  )
+
+  const beginPanFromTable = useCallback(
+    (clientX: number, clientY: number) => {
+      beginPan(clientX, clientY)
+    },
+    [beginPan],
   )
 
   const onStageMouseMove = useCallback(
@@ -217,9 +261,9 @@ export function DiagramCanvas({
       onKeyDown={handleKeyDown}
       onMouseDown={() => containerRef.current?.focus()}
     >
-      <p className="pointer-events-none absolute bottom-2 left-2 z-10 max-w-[min(100%-1rem,20rem)] text-[10px] leading-snug text-muted-foreground">
-        Drag empty space to pan · Wheel zoom · +/- keys · 0 reset · Shift or middle-drag also pans · Drag
-        tables to move
+      <p className="pointer-events-none absolute bottom-2 left-2 z-10 max-w-[min(100%-1rem,22rem)] text-[10px] leading-snug text-muted-foreground">
+        Hold Space and drag to pan (over empty space or tables) · Or drag empty space · Wheel zoom · +/- keys · 0
+        reset · Middle-drag pans · Drag tables to move
       </p>
       <Stage
         width={size.w}
@@ -269,6 +313,8 @@ export function DiagramCanvas({
                 columns={columnsByKey[t.key] ?? null}
                 selected={selectedKey === t.key}
                 palette={palette}
+                spaceHeld={spaceHeld}
+                onBeginCanvasPan={beginPanFromTable}
                 onSelect={() => onSelectKey(t.key)}
                 onDragEnd={(nx, ny) => onMoveTable(t.key, nx, ny)}
                 onRequestColumns={() => onRequestColumns(t.key)}

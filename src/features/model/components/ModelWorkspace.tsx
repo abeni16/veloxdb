@@ -10,6 +10,8 @@ import type { ColumnInfo, TableInfo } from '@/data/types'
 import {
   applyEntireModel,
   type ColumnOverride,
+  type PendingModelColumn,
+  type PendingModelForeignKey,
   type TableIdentityDraft,
 } from '@/features/model/apply-entire-model'
 import { DdlReviewDialog } from '@/features/model/components/DdlReviewDialog'
@@ -67,6 +69,10 @@ export function ModelWorkspace({
   const [columnOverridesByKey, setColumnOverridesByKey] = useState<
     Record<TableKey, Record<string, ColumnOverride>>
   >({})
+  const [pendingAddColumnsByKey, setPendingAddColumnsByKey] = useState<
+    Record<TableKey, PendingModelColumn[]>
+  >({})
+  const [pendingForeignKeys, setPendingForeignKeys] = useState<PendingModelForeignKey[]>([])
   const [applyPending, setApplyPending] = useState(false)
   const [applyError, setApplyError] = useState<string | null>(null)
 
@@ -202,6 +208,7 @@ export function ModelWorkspace({
   }, [selectedKey, inspectorTable, identityDraftByKey])
 
   const isModelDirty = useMemo(() => {
+    if (pendingForeignKeys.length > 0) return true
     for (const k of onCanvas) {
       const t = tablesByKey.get(k)
       if (!t) continue
@@ -209,9 +216,22 @@ export function ModelWorkspace({
       if (id && (id.schema !== t.schema || id.name !== t.name)) return true
       const co = columnOverridesByKey[k]
       if (co && Object.keys(co).length > 0) return true
+      const adds = pendingAddColumnsByKey[k]
+      if (adds && adds.length > 0) return true
     }
     return false
-  }, [onCanvas, tablesByKey, identityDraftByKey, columnOverridesByKey])
+  }, [
+    onCanvas,
+    tablesByKey,
+    identityDraftByKey,
+    columnOverridesByKey,
+    pendingAddColumnsByKey,
+    pendingForeignKeys,
+  ])
+
+  const catalogTablesSorted = useMemo(() => {
+    return [...tables].sort((a, b) => tableKey(a).localeCompare(tableKey(b)))
+  }, [tables])
 
   const requestColumns = useCallback((key: TableKey) => {
     setColumnRequestKeys((prev) => (prev.includes(key) ? prev : [...prev, key]))
@@ -254,6 +274,12 @@ export function ModelWorkspace({
       delete next[k]
       return next
     })
+    setPendingAddColumnsByKey((prev) => {
+      const next = { ...prev }
+      delete next[k]
+      return next
+    })
+    setPendingForeignKeys((prev) => prev.filter((fk) => fk.fromKey !== k && fk.toKey !== k))
   }, [])
 
   const handleMoveTable = useCallback((key: TableKey, x: number, y: number) => {
@@ -270,6 +296,8 @@ export function ModelWorkspace({
         tablesByKey,
         identityDraftByKey,
         columnOverridesByKey,
+        pendingAddColumnsByKey,
+        pendingForeignKeys,
       })
 
       let nextOnCanvas = [...onCanvas]
@@ -286,6 +314,8 @@ export function ModelWorkspace({
       setPositions(nextPos)
       setIdentityDraftByKey({})
       setColumnOverridesByKey({})
+      setPendingAddColumnsByKey({})
+      setPendingForeignKeys([])
       setSelectedKey((cur) => {
         if (!cur) return cur
         const hit = result.renamed.find((r) => r.from === cur)
@@ -306,6 +336,8 @@ export function ModelWorkspace({
     connectionId,
     identityDraftByKey,
     onCanvas,
+    pendingAddColumnsByKey,
+    pendingForeignKeys,
     positions,
     queryClient,
     tablesByKey,
@@ -414,6 +446,28 @@ export function ModelWorkspace({
               onColumnOverridesChange={(next) => {
                 if (!selectedKey) return
                 setColumnOverridesByKey((p) => ({ ...p, [selectedKey]: next }))
+              }}
+              catalogTables={catalogTablesSorted}
+              pendingAddColumns={selectedKey ? pendingAddColumnsByKey[selectedKey] ?? [] : []}
+              onPendingAddColumnsChange={(next) => {
+                if (!selectedKey) return
+                setPendingAddColumnsByKey((p) => {
+                  const copy = { ...p }
+                  if (next.length === 0) delete copy[selectedKey]
+                  else copy[selectedKey] = next
+                  return copy
+                })
+              }}
+              pendingForeignKeys={pendingForeignKeys}
+              onAddPendingForeignKey={(row) => {
+                if (!selectedKey) return
+                setPendingForeignKeys((prev) => [
+                  ...prev,
+                  { ...row, id: crypto.randomUUID(), fromKey: selectedKey },
+                ])
+              }}
+              onRemovePendingForeignKey={(id) => {
+                setPendingForeignKeys((prev) => prev.filter((fk) => fk.id !== id))
               }}
             />
           </div>
