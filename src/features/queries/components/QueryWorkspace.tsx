@@ -35,6 +35,7 @@ import type {
 	ResultEditPatch,
 	SaveResultEditsRequest,
 } from "@/features/queries/result-edits";
+import { notifyError } from "@/lib/error-notifier";
 import { cn } from "@/lib/utils";
 
 const MIN_QUERY_HEIGHT = 180;
@@ -84,8 +85,13 @@ type QueryWorkspaceProps = {
 	}) => void;
 	/** When switching to a tab that targets another saved connection, activate it in the shell. */
 	onActivateConnectionForTab?: (connectionId: string) => void;
-	/** Open add-row dialog (shell provides selected table + connection). */
+	/** Request inline insert row in results grid (increments trigger in shell). */
 	onOpenAddRow?: () => void;
+	insertRowTrigger: number;
+	insertConnectionId: string | null;
+	insertTable: TableInfo | null;
+	canInsertRow: boolean;
+	onInsertRowSuccess: () => void;
 };
 
 function buildPersistSnapshot(state: QueryWorkspaceState) {
@@ -139,6 +145,11 @@ type QueryPaneProps = {
 	connectionError: unknown;
 	connectionErrorMessage: string;
 	onAddRow?: () => void;
+	insertRowTrigger: number;
+	insertConnectionId: string | null;
+	insertTable: TableInfo | null;
+	canInsertRow: boolean;
+	onInsertRowSuccess: () => void;
 };
 
 function QueryPane({
@@ -164,6 +175,11 @@ function QueryPane({
 	connectionError,
 	connectionErrorMessage,
 	onAddRow,
+	insertRowTrigger,
+	insertConnectionId,
+	insertTable,
+	canInsertRow,
+	onInsertRowSuccess,
 }: QueryPaneProps) {
 	const resultsTab = tab.resultsSubTab;
 	const runPending = tab.runInFlight;
@@ -266,6 +282,11 @@ function QueryPane({
 								onRefresh={onRefreshResults}
 								onSaveEdits={onSaveResultEdits}
 								onAddRow={onAddRow}
+								insertRowTrigger={insertRowTrigger}
+								insertConnectionId={insertConnectionId}
+								insertTable={insertTable}
+								canInsertRow={canInsertRow}
+								onInsertRowSuccess={onInsertRowSuccess}
 							/>
 						</ErrorBoundary>
 					</TabsContent>
@@ -291,6 +312,11 @@ function QueryPane({
 								saveDisabledReason="Editing is not available for EXPLAIN output."
 								onRefresh={onRefreshPlan}
 								onSaveEdits={async () => {}}
+								insertRowTrigger={0}
+								insertConnectionId={null}
+								insertTable={null}
+								canInsertRow={false}
+								onInsertRowSuccess={() => {}}
 							/>
 						</ErrorBoundary>
 					</TabsContent>
@@ -358,6 +384,11 @@ export const QueryWorkspace = forwardRef<
 		onFocusedTabCapabilitiesChange,
 		onActivateConnectionForTab,
 		onOpenAddRow,
+		insertRowTrigger,
+		insertConnectionId,
+		insertTable,
+		canInsertRow,
+		onInsertRowSuccess,
 	},
 	ref,
 ) {
@@ -385,6 +416,7 @@ export const QueryWorkspace = forwardRef<
 			});
 		},
 		onError: (error, variables) => {
+			notifyError(error, { category: "query" });
 			const message =
 				error instanceof Error ? error.message : "Failed to run query";
 			dispatch({
@@ -413,6 +445,10 @@ export const QueryWorkspace = forwardRef<
 			});
 		},
 		onError: (error, variables) => {
+			notifyError(error, {
+				category: "query",
+				title: "EXPLAIN failed",
+			});
 			const message =
 				error instanceof Error ? error.message : "Failed to run EXPLAIN";
 			dispatch({
@@ -786,6 +822,11 @@ export const QueryWorkspace = forwardRef<
 					connectionError={connectionError}
 					connectionErrorMessage={connectionErrorMessage}
 					onAddRow={onOpenAddRow}
+					insertRowTrigger={insertRowTrigger}
+					insertConnectionId={insertConnectionId}
+					insertTable={insertTable}
+					canInsertRow={canInsertRow}
+					onInsertRowSuccess={onInsertRowSuccess}
 				/>
 			) : null}
 		</div>

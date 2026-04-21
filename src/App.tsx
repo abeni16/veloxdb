@@ -26,12 +26,12 @@ import {
 import { ModelWorkspace } from "@/features/model/components/ModelWorkspace";
 import { readOnboardingCompleted } from "@/features/onboarding/constants";
 import { OnboardingFlow } from "@/features/onboarding/OnboardingFlow";
-import { AddRowDialog } from "@/features/queries/components/AddRowDialog";
 import {
 	QueryWorkspace,
 	type QueryWorkspaceHandle,
 } from "@/features/queries/components/QueryWorkspace";
 import { useSaveResultEditsMutation } from "@/features/queries/queries";
+import { notifyError } from "@/lib/error-notifier";
 import {
 	buildDeleteTemplateSql,
 	buildInsertTemplateSql,
@@ -105,15 +105,26 @@ function VeloxApp() {
 		connectionId: string;
 		table: TableInfo;
 	} | null>(null);
-	const [addRowDialog, setAddRowDialog] = useState<{
-		connectionId: string;
-		table: TableInfo;
-	} | null>(null);
+	const [insertRowTrigger, setInsertRowTrigger] = useState(0);
 	const [mainWorkspace, setMainWorkspace] = useState<"query" | "model">(
 		"query",
 	);
 
 	const queryClient = useQueryClient();
+
+	const requestInsertRow = useCallback(() => {
+		setInsertRowTrigger((n) => n + 1);
+	}, []);
+
+	const handleInsertRowSuccess = useCallback(() => {
+		void queryClient.invalidateQueries({
+			queryKey: queryKeys.tableProperties(connection?.id, selectedTable),
+		});
+		void queryClient.invalidateQueries({
+			queryKey: queryKeys.schema(connection?.id, selectedTable),
+		});
+		queryWorkspaceRef.current?.refreshFocusedResults();
+	}, [connection?.id, queryClient, selectedTable]);
 
 	useEffect(() => {
 		document.documentElement.classList.toggle("dark", isDark);
@@ -136,7 +147,18 @@ function VeloxApp() {
 
 	const connectionsQuery = useConnectionsQuery();
 
+	useEffect(() => {
+		if (connectionsQuery.isError && connectionsQuery.error) {
+			notifyError(connectionsQuery.error, {
+				title: "Failed to load saved connections",
+			});
+		}
+	}, [connectionsQuery.isError, connectionsQuery.error]);
+
 	const connectMutation = useConnectMutation({
+		onError: (error) => {
+			notifyError(error, { category: "connection" });
+		},
 		onSuccess: (nextConnection) => {
 			persistLastActiveConnectionId(nextConnection.id);
 			setConnection(nextConnection);
@@ -153,6 +175,9 @@ function VeloxApp() {
 	});
 
 	const activateConnectionMutation = useActivateConnectionMutation({
+		onError: (error) => {
+			notifyError(error, { category: "connection" });
+		},
 		onSuccess: (nextConnection) => {
 			persistLastActiveConnectionId(nextConnection.id);
 			setConnection(nextConnection);
@@ -206,7 +231,14 @@ function VeloxApp() {
 		table: selectedTable,
 		enabled: Boolean(connection?.id && selectedTable),
 	});
-	const saveResultEditsMutation = useSaveResultEditsMutation();
+	const saveResultEditsMutation = useSaveResultEditsMutation({
+		onError: (error) => {
+			notifyError(error, {
+				category: "query",
+				title: "Failed to save edits",
+			});
+		},
+	});
 
 	const connectionsErrorMessage =
 		connectionsQuery.error instanceof Error
@@ -247,7 +279,7 @@ function VeloxApp() {
 			}
 			if (action === "addRow") {
 				setSelectedTable(table);
-				setAddRowDialog({ connectionId, table });
+				setInsertRowTrigger((n) => n + 1);
 				return;
 			}
 
@@ -545,14 +577,14 @@ function VeloxApp() {
 						onSaveResultEdits={handleSaveResultEdits}
 						onFocusedTabCapabilitiesChange={setFocusedQueryCaps}
 						onActivateConnectionForTab={handleActivateConnectionForTab}
+						insertRowTrigger={insertRowTrigger}
+						insertConnectionId={connection?.id ?? null}
+						insertTable={selectedTable}
+						canInsertRow={Boolean(connection?.id && selectedTable)}
+						onInsertRowSuccess={handleInsertRowSuccess}
 						onOpenAddRow={
 							connection?.id && selectedTable
-								? () => {
-										setAddRowDialog({
-											connectionId: connection.id,
-											table: selectedTable,
-										});
-									}
+								? requestInsertRow
 								: undefined
 						}
 					/>
@@ -579,8 +611,8 @@ function VeloxApp() {
 			<ConnectionDialog
 				open={connectionDialogOpen}
 				onOpenChange={setConnectionDialogOpen}
-				onSubmit={async (values) => {
-					await connectMutation.mutateAsync(values);
+				onSubmit={(values) => {
+					connectMutation.mutate(values);
 				}}
 				isPending={connectMutation.isPending}
 			/>
@@ -595,32 +627,6 @@ function VeloxApp() {
 				table={tablePropertiesTarget?.table ?? null}
 			/>
 
-			<AddRowDialog
-				key={
-					addRowDialog
-						? `${addRowDialog.connectionId}-${addRowDialog.table.schema}-${addRowDialog.table.name}`
-						: "add-row-closed"
-				}
-				open={addRowDialog !== null}
-				onOpenChange={(open) => {
-					if (!open) setAddRowDialog(null);
-				}}
-				connectionId={addRowDialog?.connectionId}
-				table={addRowDialog?.table ?? null}
-				onInserted={() => {
-					void queryClient.invalidateQueries({
-						queryKey: queryKeys.tableProperties(
-							addRowDialog?.connectionId,
-							addRowDialog?.table ?? null,
-						),
-					});
-					void queryClient.invalidateQueries({
-						queryKey: queryKeys.schema(connection?.id, addRowDialog?.table ?? null),
-					});
-					queryWorkspaceRef.current?.refreshFocusedResults();
-				}}
-			/>
-
 			<CommandPalette
 				open={commandPaletteOpen}
 				onOpenChange={setCommandPaletteOpen}
@@ -632,6 +638,7 @@ function VeloxApp() {
 				}}
 				onSelectTable={handleSelectTable}
 			/>
+
 		</div>
 	);
 }

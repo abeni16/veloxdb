@@ -87,7 +87,13 @@ export function useExplainPlanMutation(
 	});
 }
 
-export function useSaveResultEditsMutation() {
+type UseSaveResultEditsMutationOptions = {
+	onError?: (error: unknown, variables: SaveResultEditsRequest) => void;
+};
+
+export function useSaveResultEditsMutation(
+	options: UseSaveResultEditsMutationOptions = {},
+) {
 	return useMutation({
 		retry: shouldRetryTransientDbInvoke,
 		mutationFn: async (request: SaveResultEditsRequest) => {
@@ -115,10 +121,19 @@ export function useSaveResultEditsMutation() {
 				throw error;
 			}
 		},
+		onError: (error, variables) => {
+			options.onError?.(error, variables);
+		},
 	});
 }
 
-export function useInsertRowMutation() {
+type UseInsertRowMutationOptions = {
+	onError?: (error: unknown, variables: InsertRowRequest) => void;
+};
+
+export function useInsertRowMutation(
+	options: UseInsertRowMutationOptions = {},
+) {
 	return useMutation({
 		retry: shouldRetryTransientDbInvoke,
 		mutationFn: async (request: InsertRowRequest) => {
@@ -127,6 +142,9 @@ export function useInsertRowMutation() {
 				connectionId: request.connectionId,
 				sql,
 			});
+		},
+		onError: (error, variables) => {
+			options.onError?.(error, variables);
 		},
 	});
 }

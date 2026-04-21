@@ -15,6 +15,7 @@ export function useConnectionsQuery() {
 
 type UseConnectMutationOptions = {
   onSuccess?: (connection: ConnectionSummary, input: ConnectionInput) => void
+  onError?: (error: unknown, input: ConnectionInput) => void
 }
 
 type ConnectContext = {
@@ -61,14 +62,15 @@ export function useConnectMutation(options: UseConnectMutationOptions = {}) {
 
       return { previousConnections, tempId } satisfies ConnectContext
     },
-    onError: (_error, _input, context) => {
-      if (!context) return
-
-      if (context.previousConnections) {
-        queryClient.setQueryData(queryKeys.connections(), context.previousConnections)
-      } else {
-        queryClient.removeQueries({ queryKey: queryKeys.connections() })
+    onError: (error, input, context) => {
+      if (context) {
+        if (context.previousConnections) {
+          queryClient.setQueryData(queryKeys.connections(), context.previousConnections)
+        } else {
+          queryClient.removeQueries({ queryKey: queryKeys.connections() })
+        }
       }
+      options.onError?.(error, input)
     },
     onSuccess: (nextConnection, input, context) => {
       queryClient.setQueryData<ConnectionSummary[]>(queryKeys.connections(), (current) => {
@@ -89,6 +91,7 @@ export function useConnectMutation(options: UseConnectMutationOptions = {}) {
 
 type UseActivateConnectionMutationOptions = {
   onSuccess?: (connection: ConnectionSummary) => void
+  onError?: (error: unknown, connectionId: string) => void
 }
 
 export function useActivateConnectionMutation(
@@ -100,6 +103,9 @@ export function useActivateConnectionMutation(
     retry: shouldRetryTransientDbInvoke,
     mutationFn: (connectionId: string) =>
       veloxDbRepository.setActiveConnection(connectionId),
+    onError: (error, connectionId) => {
+      options.onError?.(error, connectionId)
+    },
     onSuccess: (nextConnection) => {
       // Keep connections list consistent (e.g. connectedAt/name changes).
       queryClient.setQueryData<ConnectionSummary[]>(queryKeys.connections(), (current) => {
