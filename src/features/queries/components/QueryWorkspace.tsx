@@ -1,4 +1,11 @@
-import { ClockCounterClockwiseIcon, PlusIcon, XIcon } from "@phosphor-icons/react";
+import {
+	ClockCounterClockwiseIcon,
+	DatabaseIcon,
+	PlayIcon,
+	PlusIcon,
+	PlugIcon,
+	XIcon,
+} from "@phosphor-icons/react";
 import type { UseMutationResult } from "@tanstack/react-query";
 import {
 	forwardRef,
@@ -844,50 +851,57 @@ export const QueryWorkspace = forwardRef<
 						<PlusIcon />
 					</Button>
 				</div>
-				<div className="flex shrink-0 items-center gap-2">
+				<div className="flex shrink-0 items-center gap-1.5">
 					<Button
-						variant="outline"
-						size="sm"
+						variant="ghost"
+						size="icon-sm"
 						onClick={() => setHistoryOpen(true)}
 						disabled={!activeConnectionForHistory}
+						aria-label="Open query history"
+						title="Query history"
 					>
 						<ClockCounterClockwiseIcon />
-						History
 					</Button>
 					<Button
-						variant="outline"
-						size="sm"
+						variant="ghost"
+						size="icon-sm"
 						onClick={handleToolbarExplain}
 						disabled={toolbarBusy}
+						aria-label="Run explain analyze"
+						title="Explain (analyze)"
 					>
-						Explain (analyze)
+						<DatabaseIcon />
 					</Button>
 					<Button
 						variant="outline"
-						size="sm"
+						size="icon-sm"
 						onClick={handleToolbarRunStatement}
 						disabled={toolbarBusy}
+						aria-label="Run current statement"
+						title="Run statement"
 					>
-						Run statement
+						<PlugIcon />
 					</Button>
 					<Button
 						variant="default"
-						size="sm"
+						size="icon-sm"
 						onClick={handleToolbarRun}
 						disabled={toolbarBusy}
+						aria-label="Run query"
+						title="Run query (Cmd/Ctrl + Enter)"
 					>
-						Run query
+						<PlayIcon weight="fill" />
 					</Button>
-					<span className="hidden text-[11px] uppercase tracking-[0.18em] text-muted-foreground sm:inline">
+					<span className="ml-1 hidden text-[11px] uppercase tracking-[0.16em] text-muted-foreground md:inline">
 						Cmd/Ctrl + Enter
 					</span>
 					{editorMetadataQuery.isFetching ? (
-						<span className="hidden text-[11px] text-muted-foreground lg:inline">
+						<span className="hidden text-[11px] text-muted-foreground xl:inline">
 							Loading metadata...
 						</span>
 					) : null}
 					{lintSqlMutation.isPending ? (
-						<span className="hidden text-[11px] text-muted-foreground lg:inline">
+						<span className="hidden text-[11px] text-muted-foreground xl:inline">
 							Linting...
 						</span>
 					) : null}
