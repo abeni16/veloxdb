@@ -135,22 +135,12 @@ function buildPersistSnapshot(state: QueryWorkspaceState) {
 	});
 }
 
-function extractCurrentStatement(sql: string): string {
-	const trimmed = sql.trim();
-	if (!trimmed) return "";
-	const statements = trimmed
-		.split(";")
-		.map((part) => part.trim())
-		.filter(Boolean);
-	return statements.at(-1) ?? "";
-}
-
 type QueryPaneProps = {
 	tab: QueryTabModel;
 	isDark: boolean;
 	onSqlChange: (sql: string) => void;
 	onRun: () => void;
-	onRunStatement: () => void;
+	onRunStatement: (sql: string) => void;
 	onResultsSubTabChange: (value: "results" | "plan") => void;
 	editorMetadata: ReturnType<typeof useQueryEditorMetadata>["data"];
 	lintDiagnostics: {
@@ -738,7 +728,7 @@ export const QueryWorkspace = forwardRef<
 	const handleToolbarRunStatement = useCallback(() => {
 		const tabId = getFocusedTabId(stateRef.current);
 		const sql = stateRef.current.tabs[tabId]?.sql ?? "";
-		runForTab(tabId, extractCurrentStatement(sql));
+		runForTab(tabId, sql);
 	}, [runForTab]);
 
 	const handleToolbarExplain = useCallback(() => {
@@ -754,14 +744,10 @@ export const QueryWorkspace = forwardRef<
 				event.preventDefault();
 				handleToolbarRun();
 			}
-			if (event.shiftKey && event.key === "Enter") {
-				event.preventDefault();
-				handleToolbarRunStatement();
-			}
 		};
 		window.addEventListener("keydown", onKeyDown);
 		return () => window.removeEventListener("keydown", onKeyDown);
-	}, [handleToolbarRun, handleToolbarRunStatement]);
+	}, [handleToolbarRun]);
 
 	const activeTab = state.tabs[state.activeTabId];
 	const toolbarBusy = Boolean(
@@ -921,14 +907,7 @@ export const QueryWorkspace = forwardRef<
 							stateRef.current.tabs[activeTab.id]?.sql ?? "",
 						)
 					}
-					onRunStatement={() =>
-						runForTab(
-							activeTab.id,
-							extractCurrentStatement(
-								stateRef.current.tabs[activeTab.id]?.sql ?? "",
-							),
-						)
-					}
+					onRunStatement={(sql) => runForTab(activeTab.id, sql)}
 					onResultsSubTabChange={(value) =>
 						dispatch({
 							type: "setResultsSubTab",

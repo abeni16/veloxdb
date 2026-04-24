@@ -1,7 +1,7 @@
 import Editor from "@monaco-editor/react";
 import type { Monaco } from "@monaco-editor/react";
 import type { editor, IDisposable, languages } from "monaco-editor";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { QueryEditorMetadata, SqlDiagnostic } from "@/data/types";
 
@@ -10,7 +10,7 @@ type SqlEditorProps = {
 	isDark: boolean;
 	onChange: (value: string) => void;
 	onRun: () => void;
-	onRunStatement: () => void;
+	onRunStatement: (sql: string) => void;
 	metadata?: QueryEditorMetadata;
 	diagnostics: SqlDiagnostic[];
 };
@@ -49,6 +49,138 @@ function completionItemsFromMetadata(
 	return items;
 }
 
+type SqlStatementRange = { start: number; end: number };
+
+function isWordChar(value: string) {
+	return /[A-Za-z0-9_]/.test(value);
+}
+
+function parseDollarTag(sql: string, startIndex: number): { tag: string; end: number } | null {
+	if (sql[startIndex] !== "$") return null;
+	let cursor = startIndex + 1;
+	while (cursor < sql.length && sql[cursor] !== "$") {
+		const current = sql[cursor];
+		if (!current || !isWordChar(current)) return null;
+		cursor += 1;
+	}
+	if (cursor >= sql.length || sql[cursor] !== "$") return null;
+	return { tag: sql.slice(startIndex, cursor + 1), end: cursor + 1 };
+}
+
+function getStatementRanges(sql: string): SqlStatementRange[] {
+	const ranges: SqlStatementRange[] = [];
+	let start = 0;
+	let i = 0;
+	let inSingle = false;
+	let inDouble = false;
+	let inLineComment = false;
+	let blockDepth = 0;
+	let dollarTag: string | null = null;
+
+	while (i < sql.length) {
+		const current = sql[i];
+		const next = sql[i + 1];
+		if (!current) break;
+
+		if (inLineComment) {
+			if (current === "\n") inLineComment = false;
+			i += 1;
+			continue;
+		}
+		if (blockDepth > 0) {
+			if (current === "/" && next === "*") {
+				blockDepth += 1;
+				i += 2;
+				continue;
+			}
+			if (current === "*" && next === "/") {
+				blockDepth -= 1;
+				i += 2;
+				continue;
+			}
+			i += 1;
+			continue;
+		}
+		if (dollarTag) {
+			if (sql.startsWith(dollarTag, i)) {
+				i += dollarTag.length;
+				dollarTag = null;
+				continue;
+			}
+			i += 1;
+			continue;
+		}
+		if (inSingle) {
+			if (current === "'" && next === "'") {
+				i += 2;
+				continue;
+			}
+			if (current === "'") inSingle = false;
+			i += 1;
+			continue;
+		}
+		if (inDouble) {
+			if (current === '"' && next === '"') {
+				i += 2;
+				continue;
+			}
+			if (current === '"') inDouble = false;
+			i += 1;
+			continue;
+		}
+
+		if (current === "-" && next === "-") {
+			inLineComment = true;
+			i += 2;
+			continue;
+		}
+		if (current === "/" && next === "*") {
+			blockDepth = 1;
+			i += 2;
+			continue;
+		}
+		if (current === "'") {
+			inSingle = true;
+			i += 1;
+			continue;
+		}
+		if (current === '"') {
+			inDouble = true;
+			i += 1;
+			continue;
+		}
+		if (current === "$") {
+			const parsed = parseDollarTag(sql, i);
+			if (parsed) {
+				dollarTag = parsed.tag;
+				i = parsed.end;
+				continue;
+			}
+		}
+		if (current === ";") {
+			ranges.push({ start, end: i });
+			start = i + 1;
+			i += 1;
+			continue;
+		}
+		i += 1;
+	}
+
+	ranges.push({ start, end: sql.length });
+	return ranges;
+}
+
+function resolveStatementFromOffset(sql: string, offset: number): string {
+	const ranges = getStatementRanges(sql);
+	const safeOffset = Math.max(0, Math.min(offset, sql.length));
+	for (const range of ranges) {
+		if (safeOffset >= range.start && safeOffset <= range.end) {
+			return sql.slice(range.start, range.end).trim();
+		}
+	}
+	return "";
+}
+
 export function SqlEditor({
 	value,
 	isDark,
@@ -58,13 +190,15 @@ export function SqlEditor({
 	metadata,
 	diagnostics,
 }: SqlEditorProps) {
-	const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
-	const monacoRef = useRef<Monaco | null>(null);
+	const [editorInstance, setEditorInstance] =
+		useState<editor.IStandaloneCodeEditor | null>(null);
+	const [monacoInstance, setMonacoInstance] = useState<Monaco | null>(null);
 	const providerRef = useRef<IDisposable | null>(null);
 	const markersOwner = "veloxdb-sql-lint";
 
 	useEffect(() => {
-		const model = editorRef.current?.getModel();
+		if (!editorInstance || !monacoInstance) return;
+		const model = editorInstance.getModel();
 		if (!model) return;
 		const markers: editor.IMarkerData[] = diagnostics.map((item) => {
 			const line = Math.max(1, item.line ?? 1);
@@ -79,15 +213,30 @@ export function SqlEditor({
 				endColumn: Math.max(col + 1, item.endColumn ?? col + 1),
 			};
 		});
-		monacoRef.current?.editor.setModelMarkers(model, markersOwner, markers);
-	}, [diagnostics]);
+		monacoInstance.editor.setModelMarkers(model, markersOwner, markers);
+	}, [diagnostics, editorInstance, monacoInstance]);
+
+	const resolveCurrentStatement = (instance: editor.IStandaloneCodeEditor): string => {
+		const model = instance.getModel();
+		if (!model) return "";
+
+		const selection = instance.getSelection();
+		const selectedText = selection ? model.getValueInRange(selection).trim() : "";
+		if (selectedText) return selectedText;
+
+		const position = instance.getPosition();
+		if (!position) return model.getValue().trim();
+		const text = model.getValue();
+		const cursorOffset = model.getOffsetAt(position);
+		return resolveStatementFromOffset(text, cursorOffset);
+	};
 
 	const handleMount = (
 		instance: editor.IStandaloneCodeEditor,
 		monaco: Monaco,
 	) => {
-		editorRef.current = instance;
-		monacoRef.current = monaco;
+		setEditorInstance(instance);
+		setMonacoInstance(monaco);
 		providerRef.current?.dispose();
 		providerRef.current = instance.getModel()
 			? monaco.languages.registerCompletionItemProvider("sql", {
@@ -118,16 +267,14 @@ export function SqlEditor({
 			id: "veloxdb-run-statement",
 			label: "Run statement",
 			keybindings: [1024 | 3],
-			run: () => onRunStatement(),
+			run: () => onRunStatement(resolveCurrentStatement(instance)),
 		});
 	};
 
 	useEffect(() => {
 		providerRef.current?.dispose();
-		if (!editorRef.current || !monacoRef.current) return;
-		providerRef.current = monacoRef.current.languages.registerCompletionItemProvider(
-			"sql",
-			{
+		if (!editorInstance || !monacoInstance) return;
+		providerRef.current = monacoInstance.languages.registerCompletionItemProvider("sql", {
 			provideCompletionItems: (model, position) => {
 				const word = model.getWordUntilPosition(position);
 				const range = {
@@ -143,10 +290,9 @@ export function SqlEditor({
 					})),
 				};
 			},
-			},
-		);
+		});
 		return () => providerRef.current?.dispose();
-	}, [metadata]);
+	}, [metadata, editorInstance, monacoInstance]);
 
 	return (
 		<Editor

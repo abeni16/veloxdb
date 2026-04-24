@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use tauri::{AppHandle, State};
+use tokio_postgres::error::ErrorPosition;
 use tokio_postgres::SimpleQueryMessage;
 use uuid::Uuid;
 
@@ -26,6 +27,44 @@ const MAX_EDITOR_TABLES: i64 = 150;
 const MAX_EDITOR_COLUMNS_PER_TABLE: i64 = 60;
 const MAX_EDITOR_FUNCTIONS: i64 = 200;
 const MAX_LINT_SQL_BYTES: usize = 65_536;
+
+fn byte_offset_to_line_col(sql: &str, byte_offset: usize) -> Option<(usize, usize)> {
+    if byte_offset == 0 || byte_offset > sql.len() {
+        return None;
+    }
+    let mut line = 1usize;
+    let mut column = 1usize;
+    for ch in sql[..byte_offset].chars() {
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    Some((line, column))
+}
+
+fn lint_error_range(error: &tokio_postgres::Error, sql: &str) -> (Option<usize>, Option<usize>) {
+    let Some(db_error) = error.as_db_error() else {
+        return (None, None);
+    };
+    match db_error.position() {
+        Some(ErrorPosition::Original(position)) => {
+            let byte_offset = (*position as usize).saturating_sub(1);
+            byte_offset_to_line_col(sql, byte_offset)
+                .map(|(line, col)| (Some(line), Some(col)))
+                .unwrap_or((None, None))
+        }
+        Some(ErrorPosition::Internal { position, .. }) => {
+            let byte_offset = (*position as usize).saturating_sub(1);
+            byte_offset_to_line_col(sql, byte_offset)
+                .map(|(line, col)| (Some(line), Some(col)))
+                .unwrap_or((None, None))
+        }
+        None => (None, None),
+    }
+}
 
 #[tauri::command]
 pub async fn connect_db(
@@ -316,14 +355,17 @@ pub async fn lint_sql(
         let lint_sql = format!("EXPLAIN {}", sql);
         let diagnostics = match client.simple_query(&lint_sql).await {
             Ok(_) => Vec::new(),
-            Err(error) => vec![SqlDiagnostic {
-                message: error.to_string(),
-                severity: "error".to_string(),
-                line: None,
-                column: None,
-                end_line: None,
-                end_column: None,
-            }],
+            Err(error) => {
+                let (line, column) = lint_error_range(&error, &sql);
+                vec![SqlDiagnostic {
+                    message: error.to_string(),
+                    severity: "error".to_string(),
+                    line,
+                    column,
+                    end_line: line,
+                    end_column: column.map(|value| value + 1),
+                }]
+            }
         };
         Ok(LintSqlResult { diagnostics })
     })
