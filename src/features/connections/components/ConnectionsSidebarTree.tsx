@@ -827,7 +827,7 @@ export function ConnectionsSidebarTree({
 
         {!isConnectionsLoading && visibleConnections.length === 0 ? (
           <div className="space-y-2 px-3 py-4 text-xs text-sidebar-foreground/60">
-            <p>No saved connections yet.</p>
+            <p>Create a new connection</p>
             <p>Add a connection to start browsing tables and fields.</p>
           </div>
         ) : null}
