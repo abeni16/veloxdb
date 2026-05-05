@@ -1,3 +1,5 @@
+import { save } from '@tauri-apps/plugin-dialog'
+import { veloxDbRepository } from '@/data/repositories'
 import type { ResultRow } from '@/features/queries/result-edits'
 
 function toDisplay(value: string | null | undefined) {
@@ -8,72 +10,65 @@ function csvEscape(value: string) {
   if (value.includes('"') || value.includes(',') || value.includes('\n')) {
     return `"${value.replaceAll('"', '""')}"`
   }
-
   return value
 }
 
-/** Save via Tauri save dialog + fs when available; otherwise browser download. */
-async function downloadTextFile(
-  filename: string,
-  content: string,
-  contentType: string,
-  filters: { name: string; extensions: string[] }[],
-) {
-  try {
-    const { save } = await import('@tauri-apps/plugin-dialog')
-    const { writeTextFile } = await import('@tauri-apps/plugin-fs')
-    const path = await save({
-      title: 'Export results',
-      defaultPath: filename,
-      filters,
-    })
-    if (path === null) {
-      return
-    }
-    await writeTextFile(path, content)
-    return
-  } catch {
-    // Not running under Tauri or export failed — fall back below.
-  }
-
-  const blob = new Blob([content], { type: contentType })
-  const url = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-
-  anchor.href = url
-  anchor.download = filename
-  anchor.click()
-  URL.revokeObjectURL(url)
-}
-
-export async function downloadRowsAsCsv(filename: string, columns: string[], rows: ResultRow[]) {
+function buildCsvContent(columns: string[], rows: ResultRow[]) {
   const header = columns.map(csvEscape).join(',')
-  const body = rows
-    .map((row) => columns.map((column) => csvEscape(toDisplay(row[column]))).join(','))
-    .join('\n')
-  const content = `${header}${body ? `\n${body}` : ''}`
-
-  await downloadTextFile(filename, content, 'text/csv;charset=utf-8', [
-    { name: 'CSV', extensions: ['csv'] },
-  ])
+  const body = rows.map((row) =>
+    columns.map((col) => csvEscape(toDisplay(row[col]))).join(','),
+  )
+  return [header, ...body].join('\n')
 }
 
-export async function downloadRowsAsJson(filename: string, columns: string[], rows: ResultRow[]) {
-  const normalized = rows.map((row) =>
-    columns.reduce<Record<string, string | null>>((accumulator, column) => {
-      accumulator[column] = row[column] ?? null
-      return accumulator
-    }, {}),
-  )
-  await downloadTextFile(
-    filename,
-    JSON.stringify(normalized, null, 2),
-    'application/json;charset=utf-8',
-    [{ name: 'JSON', extensions: ['json'] }],
+function buildJsonContent(columns: string[], rows: ResultRow[]) {
+  return JSON.stringify(
+    rows.map((row) => {
+      const obj: Record<string, string | null> = {}
+      for (const col of columns) {
+        obj[col] = row[col] ?? null
+      }
+      return obj
+    }),
+    null,
+    2,
   )
 }
 
 export async function copyRows(columns: string[], rows: ResultRow[]) {
-  const lines = rows.map((row) => columns.map((column) => toDisplay(row[column])).join('\t')).join('\n')
-  await navigator.clipboard.writeText(lines)
+  const header = columns.join('\t')
+  const body = rows.map((row) =>
+    columns.map((col) => toDisplay(row[col])).join('\t'),
+  )
+  await navigator.clipboard.writeText([header, ...body].join('\n'))
+}
+
+export async function downloadRowsAsCsv(
+  filename: string,
+  columns: string[],
+  rows: ResultRow[],
+) {
+  const path = await save({
+    defaultPath: filename,
+    filters: [{ name: 'CSV', extensions: ['csv'] }],
+  })
+  if (!path) return
+
+  const content = buildCsvContent(columns, rows)
+  await veloxDbRepository.saveTextFile(content, path)
+}
+
+export async function downloadRowsAsJson(
+  filename: string,
+  columns: string[],
+  rows: ResultRow[],
+) {
+  const path = await save({
+    defaultPath: filename,
+    filters: [{ name: 'JSON', extensions: ['json'] }],
+  })
+  if (!path) return
+
+  const content = buildJsonContent(columns, rows)
+  await veloxDbRepository.saveTextFile(content, path)
 }

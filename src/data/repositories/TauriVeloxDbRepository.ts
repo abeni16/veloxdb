@@ -9,13 +9,15 @@ import type {
   DatabaseInfo,
   DdlBatchRequest,
   DdlStatementRequest,
+  DiagramExportRequest,
+  ExportQueryRequest,
   ForeignKeyEdge,
   LintSqlRequest,
-  SwitchDatabaseRequest,
   LintSqlResult,
   QueryEditorMetadata,
   QueryRequest,
   QueryResult,
+  SwitchDatabaseRequest,
   TableInfo,
   TableIndexesResult,
   TablePropertiesApplyRequest,
@@ -168,6 +170,36 @@ export class TauriVeloxDbRepository implements VeloxDbRepository {
   async switchDatabase(request: SwitchDatabaseRequest): Promise<ConnectionSummary> {
     return invokeCommand('switch_database', () =>
       invoke<ConnectionSummary>('switch_database', { input: request }),
+    )
+  }
+
+  async exportDiagramPng(input: DiagramExportRequest, outputPath: string): Promise<void> {
+    return invokeCommand('export_diagram_png', () =>
+      invoke<void>('export_diagram_png', { input, outputPath }),
+    )
+  }
+
+  async exportResultsCsv(input: ExportQueryRequest): Promise<void> {
+    return invokeCommand('export_results_csv', () =>
+      invoke<void>('export_results_csv_command', { input }),
+    )
+  }
+
+  async exportResultsJson(input: ExportQueryRequest): Promise<void> {
+    return invokeCommand('export_results_json', () =>
+      invoke<void>('export_results_json_command', { input }),
+    )
+  }
+
+  async saveBase64Png(data: string, outputPath: string): Promise<void> {
+    return invokeCommand('save_base64_png', () =>
+      invoke<void>('save_base64_png', { data, outputPath }),
+    )
+  }
+
+  async saveTextFile(content: string, outputPath: string): Promise<void> {
+    return invokeCommand('save_text_file', () =>
+      invoke<void>('save_text_file', { content, outputPath }),
     )
   }
 }

@@ -192,3 +192,35 @@ export type SwitchDatabaseRequest = {
   connectionId: string
   database: string
 }
+
+export type DiagramExportNode = {
+  key: string
+  name: string
+  schema: string
+  x: number
+  y: number
+  columns: { name: string; dataType: string }[]
+  columnsTotal: number
+  headerColor?: string | null
+}
+
+export type DiagramExportEdge = {
+  fromKey: string
+  toKey: string
+  fromColumn?: string | null
+  toColumn?: string | null
+  kind: string
+}
+
+export type DiagramExportRequest = {
+  nodes: DiagramExportNode[]
+  edges: DiagramExportEdge[]
+  viewport: { x: number; y: number; zoom: number }
+  theme?: string | null
+}
+
+export type ExportQueryRequest = {
+  connectionId?: string
+  sql: string
+  outputPath: string
+}

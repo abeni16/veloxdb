@@ -6,13 +6,15 @@ import type {
   DatabaseInfo,
   DdlBatchRequest,
   DdlStatementRequest,
+  DiagramExportRequest,
+  ExportQueryRequest,
   ForeignKeyEdge,
-  SwitchDatabaseRequest,
   LintSqlRequest,
   LintSqlResult,
   QueryEditorMetadata,
   QueryRequest,
   QueryResult,
+  SwitchDatabaseRequest,
   TableInfo,
   TableIndexesResult,
   TablePropertiesApplyRequest,
@@ -45,5 +47,10 @@ export interface VeloxDbRepository {
   executeDdlStatement(request: DdlStatementRequest): Promise<void>
   listDatabases(connectionId?: string): Promise<DatabaseInfo[]>
   switchDatabase(request: SwitchDatabaseRequest): Promise<ConnectionSummary>
+  exportDiagramPng(input: DiagramExportRequest, outputPath: string): Promise<void>
+  exportResultsCsv(input: ExportQueryRequest): Promise<void>
+  exportResultsJson(input: ExportQueryRequest): Promise<void>
+  saveBase64Png(data: string, outputPath: string): Promise<void>
+  saveTextFile(content: string, outputPath: string): Promise<void>
 }
 

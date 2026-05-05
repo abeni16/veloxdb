@@ -1,4 +1,5 @@
 import { useQueries, useQueryClient } from '@tanstack/react-query'
+import { save } from '@tauri-apps/plugin-dialog'
 import { useShallow } from 'zustand/react/shallow'
 import {
   AlignBottomIcon,
@@ -845,11 +846,13 @@ export function ModelWorkspace({
     void (async () => {
       const data = await diagramExportRef.current?.toDataURL({ pixelRatio: 2 })
       if (!data) return
-      const a = document.createElement('a')
-      a.href = data
       const safe = (modelTitle.trim() || defaultDatabaseName).replace(/[^\w.-]+/g, '_')
-      a.download = `${safe}-diagram.png`
-      a.click()
+      const path = await save({
+        defaultPath: `${safe}-diagram.png`,
+        filters: [{ name: 'PNG Image', extensions: ['png'] }],
+      })
+      if (!path) return
+      await veloxDbRepository.saveBase64Png(data, path)
     })()
   }, [defaultDatabaseName, modelTitle])
 
