@@ -165,6 +165,8 @@ docker compose -f docker-compose.pg.yml up -d
 | **Tests** | Vitest |
 
 ---
+<script type="text/javascript" src="https://cdnjs.buymeacoffee.com/1.0.0/button.prod.min.js" data-name="bmc-button" data-slug="abeni3ase7i" data-color="#FFDD00" data-emoji=""  data-font="Lato" data-text="Support veloxdb" data-outline-color="#000000" data-font-color="#000000" data-coffee-color="#ffffff" ></script>
+---
 
 ## Contributing
 
