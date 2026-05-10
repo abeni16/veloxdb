@@ -24,6 +24,7 @@ export type ConnectionInput = {
   password: string
   sslMode: ConnectionSslMode
   sshConfig?: SshConfig | null
+  extraParams?: Record<string, string> | null
 }
 
 export type ConnectionSummary = {
@@ -36,6 +37,7 @@ export type ConnectionSummary = {
   connectedAt: string
   sslMode: ConnectionSslMode
   sshConfig?: SshConfig | null
+  extraParams?: Record<string, string> | null
 }
 
 export type QueryRequest = {

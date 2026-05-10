@@ -32,6 +32,7 @@ tokio-postgres = "0.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 tokio-postgres-rustls = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 webpki-roots = "0.26"
 rand = "0.8"
 keyring = "3"
