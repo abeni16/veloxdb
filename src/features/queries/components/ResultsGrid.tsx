@@ -1093,7 +1093,7 @@ export function ResultsGrid({
 							{selectColumn ? (
 								<div
 									key={selectColumn.id}
-									className="relative min-w-0 truncate border-r border-border px-3 py-2 pr-2 text-[11px] font-medium uppercase tracking-[0.18em] text-muted-foreground last:border-r-0"
+									className="relative min-w-0 truncate border-r border-border px-3 py-2 pr-2 text-[11px] font-medium text-muted-foreground last:border-r-0"
 									style={{ width: `${selectColumnWidthPx}px` }}
 								>
 									<span className="block truncate">
@@ -1125,7 +1125,7 @@ export function ResultsGrid({
 								return (
 									<div
 										key={column.id}
-										className="relative min-w-0 truncate border-r border-border px-3 py-2 pr-2 text-[11px] font-medium uppercase tracking-[0.18em] text-muted-foreground last:border-r-0"
+										className="relative min-w-0 truncate border-r border-border px-3 py-2 pr-2 text-[11px] font-medium text-muted-foreground last:border-r-0"
 										style={{ width: `${widthPx}px`, minWidth: `${widthPx}px` }}
 									>
 										<span className="block truncate">{column.id}</span>

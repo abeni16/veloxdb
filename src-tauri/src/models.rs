@@ -74,6 +74,8 @@ pub struct ConnectionInput {
     pub ssl_mode: ConnectionSslMode,
     #[serde(default)]
     pub ssh_config: Option<SshConfig>,
+    #[serde(default)]
+    pub extra_params: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +94,8 @@ pub struct StoredConnection {
     pub ssl_mode: ConnectionSslMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_config: Option<SshConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_params: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +112,8 @@ pub struct ConnectionSummary {
     pub ssl_mode: ConnectionSslMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_config: Option<SshConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_params: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -328,6 +334,7 @@ impl StoredConnection {
             connected_at: timestamp_string(),
             ssl_mode: input.ssl_mode,
             ssh_config: input.ssh_config,
+            extra_params: input.extra_params,
         }
     }
 
@@ -342,6 +349,7 @@ impl StoredConnection {
             connected_at: self.connected_at.clone(),
             ssl_mode: self.ssl_mode,
             ssh_config: self.ssh_config.clone(),
+            extra_params: self.extra_params.clone(),
         }
     }
 
@@ -356,6 +364,7 @@ impl StoredConnection {
             password: self.password.clone().unwrap_or_default(),
             ssl_mode: self.ssl_mode,
             ssh_config: self.ssh_config.clone(),
+            extra_params: self.extra_params.clone(),
         }
     }
 }

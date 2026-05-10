@@ -43,6 +43,7 @@ export function useConnectMutation(options: UseConnectMutationOptions = {}) {
         connectedAt: new Date().toISOString(),
         sslMode: input.sslMode,
         sshConfig: input.sshConfig ?? null,
+        extraParams: input.extraParams ?? null,
       }
 
       queryClient.setQueryData<ConnectionSummary[]>(queryKeys.connections(), (current) => {

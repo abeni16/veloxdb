@@ -10,6 +10,7 @@ use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 use tokio::sync::RwLock;
 use tokio_postgres::NoTls;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::models::{ConnectionInput, ConnectionSslMode, ConnectionSummary, StoredConnection};
 use crate::ssh_tunnel::SshTunnel;
@@ -41,6 +42,67 @@ pub struct AppState {
     pub ssh_tunnels: RwLock<HashMap<String, SshTunnel>>,
 }
 
+fn load_pem_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+    let data = std::fs::read(path).map_err(|e| format!("Failed to read cert file {}: {}", path, e))?;
+    let mut certs = Vec::new();
+    for result in rustls_pemfile::certs(&mut &data[..]) {
+        let cert = result.map_err(|e| format!("Failed to parse cert from {}: {}", path, e))?;
+        certs.push(cert);
+    }
+    if certs.is_empty() {
+        return Err(format!("No certificates found in {}", path));
+    }
+    Ok(certs)
+}
+
+fn load_pem_key(path: &str) -> Result<PrivateKeyDer<'static>, String> {
+    let data = std::fs::read(path).map_err(|e| format!("Failed to read key file {}: {}", path, e))?;
+    for result in rustls_pemfile::read_all(&mut &data[..]) {
+        match result {
+            Ok(rustls_pemfile::Item::Pkcs1Key(key)) => return Ok(key.into()),
+            Ok(rustls_pemfile::Item::Pkcs8Key(key)) => return Ok(key.into()),
+            Ok(rustls_pemfile::Item::Sec1Key(key)) => return Ok(key.into()),
+            Err(e) => return Err(format!("Failed to parse key from {}: {}", path, e)),
+            _ => continue,
+        }
+    }
+    Err(format!("No private key found in {}", path))
+}
+
+fn tls_connector_with_params(extra_params: &HashMap<String, String>) -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
+    let mut root_store = rustls::RootCertStore::empty();
+
+    let has_custom_root = extra_params.contains_key("sslrootcert");
+    if has_custom_root {
+        let path = extra_params.get("sslrootcert").unwrap();
+        let certs = load_pem_certs(path)?;
+        for cert in certs {
+            root_store.add(cert).map_err(|e| format!("Failed to add root cert: {}", e))?;
+        }
+    } else {
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    let config_builder = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store);
+
+    let has_client_cert = extra_params.contains_key("sslcert") && extra_params.contains_key("sslkey");
+    let config = if has_client_cert {
+        let cert_path = extra_params.get("sslcert").unwrap();
+        let key_path = extra_params.get("sslkey").unwrap();
+        let certs = load_pem_certs(cert_path)?;
+        let key = load_pem_key(key_path)?;
+        config_builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| format!("Failed to configure client auth: {}", e))?
+    } else {
+        config_builder
+            .with_no_client_auth()
+    };
+
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
+}
+
 fn tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
     static CACHE: OnceLock<Result<tokio_postgres_rustls::MakeRustlsConnect, String>> = OnceLock::new();
     CACHE
@@ -53,6 +115,57 @@ fn tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
             Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
         })
         .clone()
+}
+
+fn apply_extra_params(
+    config: &mut PostgresConfig,
+    extra_params: &HashMap<String, String>,
+) {
+    let mut remaining_opts: Vec<String> = Vec::new();
+
+    for (key, value) in extra_params {
+        match key.as_str() {
+            "connect_timeout" => {
+                if let Ok(secs) = value.parse::<u64>() {
+                    config.connect_timeout = Some(Duration::from_secs(secs));
+                }
+            }
+            "application_name" => {
+                config.application_name = Some(value.clone());
+            }
+            "keepalives_idle" => {
+                if let Ok(secs) = value.parse::<u64>() {
+                    config.keepalives_idle = Some(Duration::from_secs(secs));
+                }
+            }
+            "options" => {
+                if !value.is_empty() {
+                    remaining_opts.push(value.clone());
+                }
+            }
+            "keepalives" => {
+                if let Ok(v) = value.parse::<u64>() {
+                    config.keepalives = Some(v != 0);
+                }
+            }
+            // TLS params handled by tls_connector_with_params
+            "sslrootcert" | "sslcert" | "sslkey" => {}
+            _ => {
+                let sanitized_value = value.replace('\\', "\\\\").replace('\'', "\\'");
+                remaining_opts.push(format!("-c {}={}", key, sanitized_value));
+            }
+        }
+    }
+
+    if !remaining_opts.is_empty() {
+        let existing = config.options.clone().unwrap_or_default();
+        let merged = if existing.is_empty() {
+            remaining_opts.join(" ")
+        } else {
+            format!("{} {}", existing, remaining_opts.join(" "))
+        };
+        config.options = Some(merged);
+    }
 }
 
 pub fn build_pool_custom(host: &str, port: u16, input: &ConnectionInput) -> Result<Pool, String> {
@@ -79,12 +192,24 @@ pub fn build_pool_custom(host: &str, port: u16, input: &ConnectionInput) -> Resu
     };
     config.pool = Some(pool_config);
 
+    if let Some(ref extra) = input.extra_params {
+        apply_extra_params(&mut config, extra);
+    }
+
+    let has_tls_params = input.extra_params.as_ref().map_or(false, |e| {
+        e.contains_key("sslrootcert") || e.contains_key("sslcert") || e.contains_key("sslkey")
+    });
+
     match input.ssl_mode {
         ConnectionSslMode::Disable => config
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .map_err(|error| error.to_string()),
         ConnectionSslMode::Prefer | ConnectionSslMode::Require => {
-            let tls = tls_connector()?;
+            let tls = if has_tls_params {
+                tls_connector_with_params(input.extra_params.as_ref().unwrap())?
+            } else {
+                tls_connector()?
+            };
             config
                 .create_pool(Some(Runtime::Tokio1), tls)
                 .map_err(|error| error.to_string())
