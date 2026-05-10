@@ -34,10 +34,10 @@ const Toast = React.forwardRef<
 			ref={ref}
 			className={cn(
 				"group pointer-events-auto relative flex w-full items-center justify-between gap-3 overflow-hidden border border-border bg-background p-3 pr-8 text-foreground shadow-md transition-all data-[swipe=cancel]:translate-x-0 data-[swipe=end]:translate-x-(--radix-toast-swipe-end-x) data-[swipe=move]:translate-x-(--radix-toast-swipe-move-x) data-[state=closed]:animate-out data-[state=closed]:fade-out-80 data-[state=closed]:slide-out-to-right-full data-[state=open]:animate-in data-[state=open]:slide-in-from-top-full data-[state=open]:sm:slide-in-from-bottom-full",
-			variant === "destructive" &&
-				"border-destructive/40 bg-destructive/10 text-destructive dark:border-destructive/50",
-			variant === "success" &&
-				"border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:border-emerald-500/50 dark:text-emerald-400",
+		variant === "destructive" &&
+			"border-destructive/50 bg-destructive/20 text-destructive dark:border-destructive/60",
+		variant === "success" &&
+			"border-emerald-500/50 bg-emerald-500/20 text-emerald-600 dark:border-emerald-500/60 dark:text-emerald-400",
 			className,
 			)}
 			{...props}

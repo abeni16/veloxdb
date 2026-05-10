@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 
-import { normalizeError } from '@/lib/app-error'
+import { normalizeError, AppErrorLike } from '@/lib/app-error'
 import type {
   ConnectionInput,
   ConnectionSummary,
@@ -24,12 +24,15 @@ import type {
 } from '@/data/types'
 import type { VeloxDbRepository } from '@/data/repositories/VeloxDbRepository'
 
-async function invokeCommand<T>(context: string, fn: () => Promise<T>): Promise<T> {
+async function invokeCommand<T>(_context: string, fn: () => Promise<T>): Promise<T> {
   try {
     return await fn()
   } catch (error) {
     const normalized = normalizeError(error)
-    throw new Error(`${context}: ${normalized.message}`)
+    throw new AppErrorLike(normalized.message, normalized.category, {
+      code: normalized.code,
+      cause: error,
+    })
   }
 }
 

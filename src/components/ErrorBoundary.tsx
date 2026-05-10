@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { notifyError } from '@/lib/error-notifier'
 
 type ErrorBoundaryProps = {
   children: React.ReactNode
@@ -18,8 +19,11 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
   }
 
   componentDidCatch(error: unknown) {
-    // Keep it simple: real apps can wire this to a logger.
     console.error('ErrorBoundary caught an error:', error)
+    notifyError(error, {
+      category: "internal",
+      title: "Unexpected render error",
+    })
   }
 
   render() {

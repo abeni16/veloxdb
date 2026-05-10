@@ -7,10 +7,10 @@ import {
 } from "@/lib/app-error";
 
 const recent = new Map<string, number>();
-const DEDUP_MS = 2500;
+const DEDUP_MS = 1200;
 
-function dedupKey(title: string, description: string) {
-	return `${title}\u0000${description}`;
+function dedupKey(title: string, description: string, code?: string) {
+	return `${title}\u0000${description}\u0000${code ?? ""}`;
 }
 
 function pruneOldEntries(now: number) {
@@ -45,7 +45,7 @@ export function notifyError(
 	const description = toUserMessage(normalized);
 
 	if (!options.force) {
-		const key = dedupKey(title, description);
+		const key = dedupKey(title, description, normalized.code);
 		const now = Date.now();
 		const last = recent.get(key);
 		if (last !== undefined && now - last < DEDUP_MS) {
@@ -55,11 +55,18 @@ export function notifyError(
 		pruneOldEntries(now);
 	}
 
-	toast({
-		variant: "destructive",
-		title,
-		description,
-	});
+	try {
+		toast({
+			variant: "destructive",
+			title,
+			description,
+		});
+	} catch {
+		console.error(
+			"[notifyError] toast dispatch failed — error:",
+			normalized,
+		);
+	}
 }
 
 /**
@@ -69,9 +76,16 @@ export function notifySuccess(
 	title: string,
 	description?: string,
 ): void {
-	toast({
-		variant: "success",
-		title,
-		description,
-	});
+	try {
+		toast({
+			variant: "success",
+			title,
+			description,
+		});
+	} catch {
+		console.error(
+			"[notifySuccess] toast dispatch failed — title:",
+			title,
+		);
+	}
 }

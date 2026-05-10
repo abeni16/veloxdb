@@ -17,6 +17,7 @@ import {
   type DeleteRowsRequest,
 } from "@/features/queries/result-edits";
 import { shouldRetryTransientDbInvoke } from "@/lib/transient-invoke-retry";
+import { notifyError } from "@/lib/error-notifier";
 
 /** UI-only fields for correlating mutation results with a query tab. Stripped before IPC. */
 export type RunQueryTabVariables = QueryRequest & {
@@ -66,6 +67,9 @@ export function useLintSqlMutation() {
 		retry: 0,
 		mutationFn: ({ connectionId, sql }) =>
 			veloxDbRepository.lintSql({ connectionId, sql }),
+		onError: (error) => {
+			notifyError(error, { category: "query", title: "SQL lint failed" })
+		},
 	});
 }
 

@@ -21,6 +21,22 @@ export type AppError = {
 	cause?: unknown;
 };
 
+export class AppErrorLike extends Error {
+	declare readonly code?: string;
+	readonly category: AppErrorCategory;
+
+	constructor(
+		message: string,
+		category: AppErrorCategory,
+		options?: { code?: string; cause?: unknown },
+	) {
+		super(message, { cause: options?.cause });
+		this.name = "AppErrorLike";
+		this.category = category;
+		this.code = options?.code;
+	}
+}
+
 function messageOf(error: unknown): string {
 	if (error instanceof Error) {
 		return error.message;
@@ -101,6 +117,15 @@ export function normalizeError(
 	error: unknown,
 	options: NormalizeErrorOptions = {},
 ): AppError {
+	if (error instanceof AppErrorLike) {
+		return {
+			code: error.code,
+			category: options.category ?? error.category,
+			message: error.message,
+			cause: error.cause,
+		};
+	}
+
 	const raw = messageOf(error);
 	const inferred = inferCategoryFromMessage(raw);
 	const category = options.category ?? inferred ?? "internal";
