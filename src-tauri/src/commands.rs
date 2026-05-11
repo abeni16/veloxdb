@@ -300,6 +300,8 @@ pub async fn run_query(
         return Err("Enter a SQL statement before running the query.".to_string());
     }
 
+    let max_query_rows = input.max_rows.unwrap_or(MAX_QUERY_ROWS);
+
     with_pool_client_retry(&app, &state, &connection_id, sql, |client, sql| async move {
         let started_at = Instant::now();
         let messages = client
@@ -333,7 +335,7 @@ pub async fn run_query(
                             .collect();
                     }
 
-                    if rows.len() >= MAX_QUERY_ROWS {
+                    if rows.len() >= max_query_rows {
                         continue;
                     }
 
@@ -355,7 +357,7 @@ pub async fn run_query(
             row_count: rows.len(),
             rows,
             execution_ms: started_at.elapsed().as_millis(),
-            truncated: total_rows > MAX_QUERY_ROWS,
+            truncated: total_rows > max_query_rows,
             command_tag,
         })
     })

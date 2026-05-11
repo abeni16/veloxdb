@@ -18,6 +18,7 @@ import {
 } from "@/features/queries/result-edits";
 import { shouldRetryTransientDbInvoke } from "@/lib/transient-invoke-retry";
 import { notifyError } from "@/lib/error-notifier";
+import { useSettings } from "@/lib/settings";
 
 /** UI-only fields for correlating mutation results with a query tab. Stripped before IPC. */
 export type RunQueryTabVariables = QueryRequest & {
@@ -36,10 +37,12 @@ type UseRunQueryMutationOptions = {
 };
 
 export function useRunQueryMutation(options: UseRunQueryMutationOptions = {}) {
+	const maxQueryRows = useSettings((s) => s.maxQueryRows);
+
 	return useMutation({
 		retry: shouldRetryTransientDbInvoke,
 		mutationFn: ({ connectionId, sql }: RunQueryTabVariables) =>
-			veloxDbRepository.runQuery({ connectionId, sql }),
+			veloxDbRepository.runQuery({ connectionId, sql, maxRows: maxQueryRows }),
 		onSuccess: (result, variables) => {
 			options.onSuccess?.(result, variables);
 		},

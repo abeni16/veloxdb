@@ -43,6 +43,8 @@ export type ConnectionSummary = {
 export type QueryRequest = {
   connectionId?: string
   sql: string
+  /** Maximum rows to return. Matches the user's Settings > Results > Max rows preference. */
+  maxRows?: number
 }
 
 export type LintSqlRequest = {

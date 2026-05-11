@@ -69,7 +69,6 @@ pub fn run() {
       get_query_editor_metadata,
       save_base64_png,
       save_text_file,
-      save_text_file,
       lint_sql
     ])
     .run(tauri::generate_context!())

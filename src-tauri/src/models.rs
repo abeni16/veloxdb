@@ -121,6 +121,8 @@ pub struct ConnectionSummary {
 pub struct QueryRequest {
     pub connection_id: Option<String>,
     pub sql: String,
+    /// Maximum rows to return for this query. When omitted, the default (`MAX_QUERY_ROWS`) is used.
+    pub max_rows: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
