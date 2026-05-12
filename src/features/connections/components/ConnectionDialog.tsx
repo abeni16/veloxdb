@@ -147,6 +147,17 @@ interface CustomParam {
   value: string
 }
 
+const engineOptions: Array<{
+  value: DatabaseEngine
+  label: string
+  hint: string
+  experimental?: boolean
+}> = [
+  { value: 'postgres', label: 'PostgreSQL', hint: 'Recommended default' },
+  { value: 'mysql', label: 'MySQL', hint: 'Experimental', experimental: true },
+  { value: 'sqlite', label: 'SQLite', hint: 'Experimental', experimental: true },
+]
+
 export function ConnectionDialog({
   open,
   onOpenChange,
@@ -424,21 +435,86 @@ export function ConnectionDialog({
           )}
 
           <div className={cn('grid gap-4 sm:grid-cols-2', inputMode === 'string' && 'hidden')}>
-            <Field
-              label="Database engine"
-              inputId="veloxdb-connection-engine"
-              error={form.formState.errors.engine?.message}
-            >
-              <select
-                id="veloxdb-connection-engine"
-                className={selectClassName}
-                {...form.register('engine')}
-              >
-                <option value="postgres">PostgreSQL</option>
-                <option value="mysql">MySQL</option>
-                <option value="sqlite">SQLite</option>
-              </select>
-            </Field>
+            <div className="space-y-2 sm:col-span-2">
+              <span className="block text-left text-xs text-muted-foreground">Database engine</span>
+              <div className="grid gap-2 sm:grid-cols-3" role="radiogroup" aria-label="Database engine">
+                {engineOptions.map((option) => {
+                  const inputId = `veloxdb-connection-engine-${option.value}`
+                  const selected = engine === option.value
+
+                  return (
+                    <label key={option.value} htmlFor={inputId} className="block h-full cursor-pointer">
+                      <input
+                        id={inputId}
+                        type="radio"
+                        value={option.value}
+                        className="sr-only"
+                        {...form.register('engine')}
+                      />
+                      <div
+                        className={cn(
+                          'flex h-full min-h-[92px] items-center gap-2.5 rounded-md border p-3 text-left transition-all',
+                          selected
+                            ? 'border-emerald-500/40 bg-emerald-500/10 ring-1 ring-emerald-500/30'
+                            : 'border-border bg-background hover:border-primary/40',
+                        )}
+                      >
+                        <div className="flex h-9 w-16 shrink-0 items-center justify-start">
+                          {option.value === 'postgres' ? (
+                            <img
+                              src="/postgresql.svg"
+                              alt="PostgreSQL"
+                              className="h-full w-full object-contain object-left"
+                            />
+                          ) : null}
+                          {option.value === 'mysql' ? (
+                            <>
+                              <img
+                                src="/mysql-wordmark-dark.svg"
+                                alt="MySQL"
+                                className="h-full w-full object-contain object-left dark:hidden"
+                              />
+                              <img
+                                src="/mysql-wordmark-light.svg"
+                                alt="MySQL"
+                                className="hidden h-full w-full object-contain object-left dark:block"
+                              />
+                            </>
+                          ) : null}
+                          {option.value === 'sqlite' ? (
+                            <img
+                              src="/sqlite.svg"
+                              alt="SQLite"
+                              className="h-full w-full object-contain object-left"
+                            />
+                          ) : null}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-sm font-medium text-foreground">{option.label}</span>
+                            {option.experimental ? (
+                            <span className="rounded-full border border-amber-500/50 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-normal text-amber-600 dark:text-amber-400">
+                                Experimental
+                              </span>
+                            ) : null}
+                          </div>
+                          <p className="mt-1 text-[11px] text-muted-foreground">{option.hint}</p>
+                        </div>
+                      </div>
+                    </label>
+                  )
+                })}
+              </div>
+              <p className="text-[11px] text-muted-foreground/80">
+                PostgreSQL is the safest default. MySQL and SQLite are marked experimental and may
+                have limited support.
+              </p>
+              {form.formState.errors.engine?.message ? (
+                <span className="block text-xs text-destructive">
+                  {form.formState.errors.engine.message}
+                </span>
+              ) : null}
+            </div>
 
             <Field
               label="Connection name"
