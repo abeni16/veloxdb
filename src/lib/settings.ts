@@ -17,6 +17,9 @@ export type AppSettings = {
   clickToCopy: boolean
   autoReconnect: boolean
   pingIntervalSec: number
+  veloxyOpenRouterApiKey: string
+  veloxyModel: string
+  veloxyBaseUrl: string
 }
 
 const defaults: AppSettings = {
@@ -31,6 +34,9 @@ const defaults: AppSettings = {
   clickToCopy: true,
   autoReconnect: true,
   pingIntervalSec: 30,
+  veloxyOpenRouterApiKey: '',
+  veloxyModel: 'deepseek/deepseek-chat',
+  veloxyBaseUrl: 'https://openrouter.ai/api/v1',
 }
 
 export const useSettings = create<AppSettings>()(

@@ -2,6 +2,8 @@ import { invoke } from '@tauri-apps/api/core'
 
 import { normalizeError, AppErrorLike } from '@/lib/app-error'
 import type {
+  AskVeloxyRequest,
+  AskVeloxyResponse,
   ConnectionInput,
   ConnectionSummary,
   ColumnInfo,
@@ -79,6 +81,12 @@ export class TauriVeloxDbRepository implements VeloxDbRepository {
   async runQuery(request: QueryRequest): Promise<QueryResult> {
     return invokeCommand('run_query', () =>
       invoke<QueryResult>('run_query', { input: request }),
+    )
+  }
+
+  async generateSqlFromNl(request: AskVeloxyRequest): Promise<AskVeloxyResponse> {
+    return invokeCommand('generate_sql_from_nl', () =>
+      invoke<AskVeloxyResponse>('generate_sql_from_nl', { input: request }),
     )
   }
 

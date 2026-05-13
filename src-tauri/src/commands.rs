@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
+use reqwest::Client;
+use serde_json::Value;
 use tauri::{AppHandle, State};
 use sqlx::{Column, Decode, Row, Type};
 use sqlx::mysql::{MySql, MySqlRow};
@@ -17,6 +19,7 @@ use crate::db::{
 };
 use crate::credentials;
 use crate::models::{
+    AskVeloxyDbContextCache, AskVeloxyRequest, AskVeloxyResponse, AskVeloxyTokenStats, AskVeloxyTableRef,
     ColumnInfo, ColumnProperties, ConnectionInput, ConnectionSummary, DatabaseInfo, DdlBatchRequest,
     DdlStatementRequest, ForeignKeyEdge, IndexInfo, QueryRequest, QueryResult, SchemaRequest,
     LintSqlRequest, LintSqlResult, QueryEditorColumn, QueryEditorFunction, QueryEditorMetadata,
@@ -38,6 +41,11 @@ const MAX_EDITOR_TABLES: i64 = 150;
 const MAX_EDITOR_COLUMNS_PER_TABLE: i64 = 60;
 const MAX_EDITOR_FUNCTIONS: i64 = 200;
 const MAX_LINT_SQL_BYTES: usize = 65_536;
+const ASK_VELOXY_MAX_CONTEXT_TABLES: usize = 8;
+const ASK_VELOXY_MAX_CONTEXT_COLUMNS: usize = 18;
+const ASK_VELOXY_MAX_CONTEXT_RELATIONSHIPS: usize = 36;
+const ASK_VELOXY_SCHEMA_CHAR_BUDGET: usize = 6_000;
+const ASK_VELOXY_PROMPT_CHAR_BUDGET: usize = 12_000;
 
 fn mysql_decode_error(context: &str, column_name: &str, index: Option<usize>, detail: &str) -> String {
     match index {
@@ -722,6 +730,417 @@ pub async fn run_query(
     }
 }
 
+async fn fetch_query_editor_metadata_for_connection(
+    app: &AppHandle,
+    state: &AppState,
+    connection_id: &str,
+    engine: DatabaseEngine,
+) -> Result<QueryEditorMetadata, String> {
+    if engine == DatabaseEngine::Mysql {
+        let pool = get_or_create_mysql_pool(app, state, connection_id).await?;
+        let table_rows = sqlx::query(
+            "
+            select table_schema, table_name
+            from information_schema.tables
+            where table_type = 'BASE TABLE'
+              and table_schema not in ('information_schema', 'mysql', 'performance_schema', 'sys')
+            order by table_schema, table_name
+            limit ?
+            ",
+        )
+        .bind(MAX_EDITOR_TABLES + 1)
+        .fetch_all(&pool)
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let truncated_tables = table_rows.len() as i64 > MAX_EDITOR_TABLES;
+        let mut tables = Vec::new();
+        let mut truncated_columns = false;
+
+        for row in table_rows.into_iter().take(MAX_EDITOR_TABLES as usize) {
+            let schema: String = mysql_get_idx(&row, 0, "table_schema", "get_query_editor_metadata")?;
+            let name: String = mysql_get_idx(&row, 1, "table_name", "get_query_editor_metadata")?;
+            let column_rows = sqlx::query(
+                "
+                select column_name, data_type
+                from information_schema.columns
+                where table_schema = ? and table_name = ?
+                order by ordinal_position
+                limit ?
+                ",
+            )
+            .bind(&schema)
+            .bind(&name)
+            .bind(MAX_EDITOR_COLUMNS_PER_TABLE + 1)
+            .fetch_all(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+            if column_rows.len() as i64 > MAX_EDITOR_COLUMNS_PER_TABLE {
+                truncated_columns = true;
+            }
+            let mut columns = Vec::new();
+            for column in column_rows.into_iter().take(MAX_EDITOR_COLUMNS_PER_TABLE as usize) {
+                columns.push(QueryEditorColumn {
+                    name: mysql_get_idx(&column, 0, "column_name", "get_query_editor_metadata")?,
+                    data_type: mysql_get_idx(&column, 1, "data_type", "get_query_editor_metadata")?,
+                });
+            }
+            tables.push(QueryEditorTable { schema, name, columns });
+        }
+
+        return Ok(QueryEditorMetadata {
+            tables,
+            functions: Vec::new(),
+            truncated_tables,
+            truncated_columns,
+            truncated_functions: false,
+        });
+    }
+
+    if engine == DatabaseEngine::Sqlite {
+        let pool = get_or_create_sqlite_pool(app, state, connection_id).await?;
+        let table_rows = sqlx::query(
+            "
+            select name
+            from sqlite_master
+            where type = 'table'
+              and name not like 'sqlite_%'
+            order by name
+            limit ?
+            ",
+        )
+        .bind(MAX_EDITOR_TABLES + 1)
+        .fetch_all(&pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let truncated_tables = table_rows.len() as i64 > MAX_EDITOR_TABLES;
+        let mut tables = Vec::new();
+        let mut truncated_columns = false;
+        for row in table_rows.into_iter().take(MAX_EDITOR_TABLES as usize) {
+            let name: String = sqlite_get_idx(&row, 0, "name", "get_query_editor_metadata")?;
+            let pragma_sql = format!("PRAGMA table_info(\"{}\");", quote_identifier(&name));
+            let column_rows = sqlx::query(&pragma_sql)
+                .fetch_all(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            if column_rows.len() as i64 > MAX_EDITOR_COLUMNS_PER_TABLE {
+                truncated_columns = true;
+            }
+            let mut columns = Vec::new();
+            for column in column_rows.into_iter().take(MAX_EDITOR_COLUMNS_PER_TABLE as usize) {
+                columns.push(QueryEditorColumn {
+                    name: sqlite_get_name(&column, "name", "get_query_editor_metadata")?,
+                    data_type: sqlite_get_name(&column, "type", "get_query_editor_metadata")?,
+                });
+            }
+            tables.push(QueryEditorTable {
+                schema: "main".to_string(),
+                name,
+                columns,
+            });
+        }
+        return Ok(QueryEditorMetadata {
+            tables,
+            functions: Vec::new(),
+            truncated_tables,
+            truncated_columns,
+            truncated_functions: false,
+        });
+    }
+
+    with_pool_client_retry(app, state, connection_id, (), |client, ()| async move {
+        let table_rows = client
+            .query(
+                "
+            select n.nspname::text as schema_name, c.relname::text as table_name
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            where c.relkind in ('r', 'p', 'v', 'm', 'f')
+              and n.nspname not in ('pg_catalog', 'information_schema')
+            order by n.nspname, c.relname
+            limit $1
+            ",
+                &[&(MAX_EDITOR_TABLES + 1)],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let truncated_tables = table_rows.len() as i64 > MAX_EDITOR_TABLES;
+        let table_rows = if truncated_tables {
+            table_rows
+                .into_iter()
+                .take(MAX_EDITOR_TABLES as usize)
+                .collect::<Vec<_>>()
+        } else {
+            table_rows
+        };
+
+        let mut tables = Vec::with_capacity(table_rows.len());
+        let mut truncated_columns = false;
+
+        for row in table_rows {
+            let schema: String = row.get(0);
+            let name: String = row.get(1);
+            let column_rows = client
+                .query(
+                    "
+                select a.attname::text as column_name,
+                       format_type(a.atttypid, a.atttypmod)::text as data_type
+                from pg_attribute a
+                join pg_class c on c.oid = a.attrelid
+                join pg_namespace n on n.oid = c.relnamespace
+                where n.nspname = $1
+                  and c.relname = $2
+                  and a.attnum > 0
+                  and not a.attisdropped
+                order by a.attnum
+                limit $3
+                ",
+                    &[&schema, &name, &(MAX_EDITOR_COLUMNS_PER_TABLE + 1)],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+
+            let columns_exceeded = column_rows.len() as i64 > MAX_EDITOR_COLUMNS_PER_TABLE;
+            if columns_exceeded {
+                truncated_columns = true;
+            }
+            let columns = column_rows
+                .into_iter()
+                .take(MAX_EDITOR_COLUMNS_PER_TABLE as usize)
+                .map(|column| QueryEditorColumn {
+                    name: column.get(0),
+                    data_type: column.get(1),
+                })
+                .collect();
+
+            tables.push(QueryEditorTable {
+                schema,
+                name,
+                columns,
+            });
+        }
+
+        let function_rows = client
+            .query(
+                "
+            select
+              n.nspname::text as schema_name,
+              p.proname::text as function_name,
+              coalesce(pg_get_function_identity_arguments(p.oid), '')::text as args,
+              pg_get_function_result(p.oid)::text as return_type
+            from pg_proc p
+            join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname not in ('pg_catalog', 'information_schema')
+            order by n.nspname, p.proname
+            limit $1
+            ",
+                &[&(MAX_EDITOR_FUNCTIONS + 1)],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let truncated_functions = function_rows.len() as i64 > MAX_EDITOR_FUNCTIONS;
+        let functions = function_rows
+            .into_iter()
+            .take(MAX_EDITOR_FUNCTIONS as usize)
+            .map(|row| {
+                let args_raw: String = row.get(2);
+                QueryEditorFunction {
+                    schema: row.get(0),
+                    name: row.get(1),
+                    arg_types: if args_raw.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        args_raw
+                            .split(',')
+                            .map(|value| value.trim().to_string())
+                            .collect()
+                    },
+                    return_type: row.get(3),
+                }
+            })
+            .collect();
+
+        Ok(QueryEditorMetadata {
+            tables,
+            functions,
+            truncated_tables,
+            truncated_columns,
+            truncated_functions,
+        })
+    })
+    .await
+}
+
+async fn fetch_foreign_keys_for_connection(
+    app: &AppHandle,
+    state: &AppState,
+    connection_id: &str,
+    engine: DatabaseEngine,
+) -> Result<Vec<ForeignKeyEdge>, String> {
+    if engine == DatabaseEngine::Mysql {
+        let pool = get_or_create_mysql_pool(app, state, connection_id).await?;
+        let rows = sqlx::query(
+            "
+            select
+              kcu.table_schema as from_schema,
+              kcu.table_name as from_table,
+              kcu.column_name as from_column,
+              kcu.referenced_table_schema as to_schema,
+              kcu.referenced_table_name as to_table,
+              kcu.referenced_column_name as to_column
+            from information_schema.key_column_usage kcu
+            where kcu.referenced_table_name is not null
+            order by kcu.table_schema, kcu.table_name, kcu.ordinal_position
+            limit ?
+            ",
+        )
+        .bind(MAX_FOREIGN_KEY_ROWS)
+        .fetch_all(&pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let mut edges = Vec::new();
+        for row in rows {
+            edges.push(ForeignKeyEdge {
+                from_schema: mysql_get_idx(&row, 0, "from_schema", "get_foreign_keys")?,
+                from_table: mysql_get_idx(&row, 1, "from_table", "get_foreign_keys")?,
+                from_column: mysql_get_idx(&row, 2, "from_column", "get_foreign_keys")?,
+                to_schema: mysql_get_idx(&row, 3, "to_schema", "get_foreign_keys")?,
+                to_table: mysql_get_idx(&row, 4, "to_table", "get_foreign_keys")?,
+                to_column: mysql_get_idx(&row, 5, "to_column", "get_foreign_keys")?,
+            });
+        }
+        return Ok(edges);
+    }
+
+    if engine == DatabaseEngine::Sqlite {
+        let pool = get_or_create_sqlite_pool(app, state, connection_id).await?;
+        let tables = sqlx::query(
+            "
+            select name
+            from sqlite_master
+            where type = 'table'
+              and name not like 'sqlite_%'
+            ",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let mut edges = Vec::new();
+        for table in tables {
+            let table_name: String = sqlite_get_idx(&table, 0, "name", "get_foreign_keys")?;
+            let fk_sql = format!("PRAGMA foreign_key_list(\"{}\");", quote_identifier(&table_name));
+            let fk_rows = sqlx::query(&fk_sql)
+                .fetch_all(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            for row in fk_rows {
+                edges.push(ForeignKeyEdge {
+                    from_schema: "main".to_string(),
+                    from_table: table_name.clone(),
+                    from_column: sqlite_get_name(&row, "from", "get_foreign_keys")?,
+                    to_schema: "main".to_string(),
+                    to_table: sqlite_get_name(&row, "table", "get_foreign_keys")?,
+                    to_column: sqlite_get_name(&row, "to", "get_foreign_keys")?,
+                });
+                if edges.len() >= MAX_FOREIGN_KEY_ROWS as usize {
+                    return Ok(edges);
+                }
+            }
+        }
+        return Ok(edges);
+    }
+
+    with_pool_client_retry(app, state, connection_id, (), |client, ()| async move {
+        let rows = client
+            .query(
+                "
+            select
+              src_ns.nspname::text as from_schema,
+              src_cls.relname::text as from_table,
+              src_att.attname::text as from_column,
+              tgt_ns.nspname::text as to_schema,
+              tgt_cls.relname::text as to_table,
+              tgt_att.attname::text as to_column
+            from pg_constraint c
+            join pg_class src_cls on src_cls.oid = c.conrelid
+            join pg_namespace src_ns on src_ns.oid = src_cls.relnamespace
+            join pg_class tgt_cls on tgt_cls.oid = c.confrelid
+            join pg_namespace tgt_ns on tgt_ns.oid = tgt_cls.relnamespace
+            cross join lateral unnest(c.conkey, c.confkey) as u(attnum, confattnum)
+            join pg_attribute src_att
+              on src_att.attrelid = c.conrelid
+             and src_att.attnum = u.attnum
+             and not src_att.attisdropped
+            join pg_attribute tgt_att
+              on tgt_att.attrelid = c.confrelid
+             and tgt_att.attnum = u.confattnum
+             and not tgt_att.attisdropped
+            where c.contype = 'f'
+              and src_ns.nspname not in ('pg_catalog', 'information_schema')
+            order by src_ns.nspname, src_cls.relname, c.conname, u.attnum
+            limit $1
+            ",
+                &[&MAX_FOREIGN_KEY_ROWS],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| ForeignKeyEdge {
+                from_schema: row.get(0),
+                from_table: row.get(1),
+                from_column: row.get(2),
+                to_schema: row.get(3),
+                to_table: row.get(4),
+                to_column: row.get(5),
+            })
+            .collect())
+    })
+    .await
+}
+
+fn ask_veloxy_context_cache_key(connection_id: &str, database_name: &str) -> String {
+    format!("{}::{}", connection_id, database_name)
+}
+
+async fn get_or_build_ask_veloxy_db_context(
+    app: &AppHandle,
+    state: &AppState,
+    connection_id: &str,
+    engine: DatabaseEngine,
+) -> Result<AskVeloxyDbContextCache, String> {
+    let stored_connection = load_connection(app, connection_id)?
+        .ok_or_else(|| "Stored connection details were not found.".to_string())?;
+    let cache_key = ask_veloxy_context_cache_key(connection_id, &stored_connection.database);
+    if let Some(cached) = state
+        .ask_veloxy_db_context_cache
+        .read()
+        .await
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
+    let metadata = fetch_query_editor_metadata_for_connection(app, state, connection_id, engine).await?;
+    let foreign_keys = fetch_foreign_keys_for_connection(app, state, connection_id, engine).await?;
+    let cache = AskVeloxyDbContextCache {
+        database_name: stored_connection.database,
+        engine,
+        metadata,
+        foreign_keys,
+    };
+    state
+        .ask_veloxy_db_context_cache
+        .write()
+        .await
+        .insert(cache_key, cache.clone());
+    Ok(cache)
+}
+
 #[tauri::command]
 pub async fn get_query_editor_metadata(
     app: AppHandle,
@@ -965,6 +1384,344 @@ pub async fn get_query_editor_metadata(
         })
     })
     .await
+}
+
+fn estimate_tokens(chars: usize) -> usize {
+    // Lightweight estimate good enough for budget telemetry.
+    (chars / 4).max(1)
+}
+
+fn normalize_openrouter_base(base: Option<&str>) -> String {
+    let trimmed = base.unwrap_or("https://openrouter.ai/api/v1").trim();
+    let value = if trimmed.is_empty() {
+        "https://openrouter.ai/api/v1"
+    } else {
+        trimmed
+    };
+    value.trim_end_matches('/').to_string()
+}
+
+fn truncate_on_char_boundary(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut truncate_at = max_bytes;
+    while !value.is_char_boundary(truncate_at) && truncate_at > 0 {
+        truncate_at -= 1;
+    }
+    value.truncate(truncate_at);
+}
+
+fn table_matches_target(table: &QueryEditorTable, target: Option<&AskVeloxyTableRef>) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    table.schema.eq_ignore_ascii_case(&target.schema) && table.name.eq_ignore_ascii_case(&target.name)
+}
+
+fn table_relevance_score(table: &QueryEditorTable, prompt_lower: &str) -> usize {
+    let mut score = 0usize;
+    let full_name = format!("{}.{}", table.schema.to_lowercase(), table.name.to_lowercase());
+    if prompt_lower.contains(&table.name.to_lowercase()) {
+        score += 3;
+    }
+    if prompt_lower.contains(&table.schema.to_lowercase()) {
+        score += 2;
+    }
+    if prompt_lower.contains(&full_name) {
+        score += 4;
+    }
+    score
+}
+
+fn relationship_relevance_score(edge: &ForeignKeyEdge, prompt_lower: &str) -> usize {
+    let from_name = format!("{}.{}", edge.from_schema.to_lowercase(), edge.from_table.to_lowercase());
+    let to_name = format!("{}.{}", edge.to_schema.to_lowercase(), edge.to_table.to_lowercase());
+    let mut score = 0usize;
+    if prompt_lower.contains(&edge.from_table.to_lowercase()) || prompt_lower.contains(&from_name) {
+        score += 2;
+    }
+    if prompt_lower.contains(&edge.to_table.to_lowercase()) || prompt_lower.contains(&to_name) {
+        score += 2;
+    }
+    score
+}
+
+fn build_schema_context(
+    db_context: &AskVeloxyDbContextCache,
+    prompt: &str,
+    target_table: Option<&AskVeloxyTableRef>,
+) -> String {
+    let prompt_lower = prompt.to_lowercase();
+    let mut ranked: Vec<(&QueryEditorTable, usize, bool)> = db_context
+        .metadata
+        .tables
+        .iter()
+        .map(|table| {
+            (
+                table,
+                table_relevance_score(table, &prompt_lower),
+                table_matches_target(table, target_table),
+            )
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
+
+    let mut schema_context = String::new();
+    schema_context.push_str(&format!(
+        "database {} engine {:?}\n",
+        db_context.database_name, db_context.engine
+    ));
+    for (table, _score, _is_target) in ranked.into_iter().take(ASK_VELOXY_MAX_CONTEXT_TABLES) {
+        let columns = table
+            .columns
+            .iter()
+            .take(ASK_VELOXY_MAX_CONTEXT_COLUMNS)
+            .map(|column| format!("{}:{}", column.name, column.data_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        schema_context.push_str(&format!(
+            "table {}.{} columns [{}]\n",
+            table.schema, table.name, columns
+        ));
+        if schema_context.len() >= ASK_VELOXY_SCHEMA_CHAR_BUDGET {
+            truncate_on_char_boundary(&mut schema_context, ASK_VELOXY_SCHEMA_CHAR_BUDGET);
+            break;
+        }
+    }
+
+    let mut ranked_relationships = db_context
+        .foreign_keys
+        .iter()
+        .map(|edge| (edge, relationship_relevance_score(edge, &prompt_lower)))
+        .collect::<Vec<_>>();
+    ranked_relationships.sort_by(|a, b| b.1.cmp(&a.1));
+    for (edge, _score) in ranked_relationships
+        .into_iter()
+        .take(ASK_VELOXY_MAX_CONTEXT_RELATIONSHIPS)
+    {
+        schema_context.push_str(&format!(
+            "relationship {}.{}({}) -> {}.{}({})\n",
+            edge.from_schema,
+            edge.from_table,
+            edge.from_column,
+            edge.to_schema,
+            edge.to_table,
+            edge.to_column
+        ));
+        if schema_context.len() >= ASK_VELOXY_SCHEMA_CHAR_BUDGET {
+            truncate_on_char_boundary(&mut schema_context, ASK_VELOXY_SCHEMA_CHAR_BUDGET);
+            break;
+        }
+    }
+    schema_context
+}
+
+fn classify_sql_intent(sql: &str) -> String {
+    let normalized = sql.trim_start().to_ascii_lowercase();
+    if normalized.starts_with("select") || normalized.starts_with("with") {
+        return "select".to_string();
+    }
+    if normalized.starts_with("insert") {
+        return "insert".to_string();
+    }
+    if normalized.starts_with("update") {
+        return "update".to_string();
+    }
+    if normalized.starts_with("delete") {
+        return "delete".to_string();
+    }
+    if normalized.starts_with("explain") {
+        return "explain".to_string();
+    }
+    "unknown".to_string()
+}
+
+fn has_multiple_statements(sql: &str) -> bool {
+    let statements = sql
+        .split(';')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .count();
+    statements > 1
+}
+
+fn validate_generated_sql(sql: &str) -> Result<(), String> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err("Ask Veloxy returned an empty SQL statement.".to_string());
+    }
+    if has_multiple_statements(trimmed) {
+        return Err("Ask Veloxy generated multiple SQL statements. Please ask for a single statement.".to_string());
+    }
+    Ok(())
+}
+
+fn extract_openrouter_message_content(payload: &Value) -> Result<String, String> {
+    let content_value = payload
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .ok_or_else(|| "OpenRouter response missing choices[0].message.content".to_string())?;
+
+    if let Some(content) = content_value.as_str() {
+        return Ok(content.to_string());
+    }
+
+    if let Some(items) = content_value.as_array() {
+        let mut merged = String::new();
+        for item in items {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                merged.push_str(text);
+            }
+        }
+        if !merged.trim().is_empty() {
+            return Ok(merged);
+        }
+    }
+
+    Err("OpenRouter returned an unsupported message format.".to_string())
+}
+
+fn parse_ask_veloxy_json(content: &str) -> Result<Value, String> {
+    if let Ok(value) = serde_json::from_str::<Value>(content) {
+        return Ok(value);
+    }
+    let start = content.find('{');
+    let end = content.rfind('}');
+    match (start, end) {
+        (Some(start_idx), Some(end_idx)) if end_idx > start_idx => {
+            serde_json::from_str::<Value>(&content[start_idx..=end_idx])
+                .map_err(|error| format!("Ask Veloxy response was not valid JSON: {}", error))
+        }
+        _ => Err("Ask Veloxy response did not contain JSON.".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn generate_sql_from_nl(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: AskVeloxyRequest,
+) -> Result<AskVeloxyResponse, String> {
+    let natural_prompt = input.natural_prompt.trim();
+    if natural_prompt.is_empty() {
+        return Err("Ask Veloxy prompt cannot be empty.".to_string());
+    }
+    if input.provider_config.api_key.trim().is_empty() {
+        return Err("OpenRouter API key is required.".to_string());
+    }
+    if input.provider_config.model.trim().is_empty() {
+        return Err("OpenRouter model is required.".to_string());
+    }
+
+    let (connection_id, engine) =
+        resolve_connection_engine(&app, &state, input.connection_id.clone()).await?;
+    let db_context = get_or_build_ask_veloxy_db_context(&app, &state, &connection_id, engine).await?;
+    let schema_context = build_schema_context(&db_context, natural_prompt, input.target_table.as_ref());
+
+    let mut user_prompt = format!(
+        "Engine: {:?}\nDatabase: {}\nTask: {}\nMaxRows: {}\nSchemaContext:\n{}\n",
+        db_context.engine,
+        db_context.database_name,
+        natural_prompt,
+        input.max_rows.unwrap_or(MAX_QUERY_ROWS),
+        schema_context
+    );
+    truncate_on_char_boundary(&mut user_prompt, ASK_VELOXY_PROMPT_CHAR_BUDGET);
+
+    let system_prompt = "You are Ask Veloxy. Return JSON only with keys: sql (string), intent (string), confidence (number 0..1), warnings (array of strings). Generate exactly one SQL statement and never include markdown.";
+    let base_url = normalize_openrouter_base(input.provider_config.base_url.as_deref());
+    let endpoint = format!("{}/chat/completions", base_url);
+
+    let client = Client::new();
+    let response = client
+        .post(&endpoint)
+        .header("Authorization", format!("Bearer {}", input.provider_config.api_key.trim()))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": input.provider_config.model.trim(),
+            "temperature": 0.1,
+            "max_tokens": 500,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt }
+            ]
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("OpenRouter request failed: {}", error))?;
+
+    let status = response.status();
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Invalid OpenRouter JSON response: {}", error))?;
+    if !status.is_success() {
+        let message = payload
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown OpenRouter error");
+        return Err(format!("OpenRouter error ({}): {}", status.as_u16(), message));
+    }
+
+    let message_content = extract_openrouter_message_content(&payload)?;
+    let generated = parse_ask_veloxy_json(&message_content)?;
+    let sql = generated
+        .get("sql")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    validate_generated_sql(&sql)?;
+
+    let mut warnings = generated
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let intent = generated
+        .get("intent")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| classify_sql_intent(&sql));
+    let confidence = generated
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.6)
+        .clamp(0.0, 1.0);
+
+    if intent != "select" {
+        warnings.push("Generated SQL is not read-only. Review before execution.".to_string());
+    }
+    if confidence < 0.5 {
+        warnings.push("Low confidence result. Review SQL carefully.".to_string());
+    }
+
+    let token_stats = AskVeloxyTokenStats {
+        schema_chars: schema_context.len(),
+        schema_tokens_estimate: estimate_tokens(schema_context.len()),
+        prompt_chars: user_prompt.len() + system_prompt.len(),
+        prompt_tokens_estimate: estimate_tokens(user_prompt.len() + system_prompt.len()),
+    };
+
+    Ok(AskVeloxyResponse {
+        sql,
+        intent,
+        confidence,
+        warnings,
+        token_stats,
+    })
 }
 
 #[tauri::command]
@@ -2264,7 +3021,11 @@ pub async fn save_text_file(content: String, output_path: String) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{mysql_decode_error, sqlite_decode_error};
+    use super::{
+        build_schema_context, classify_sql_intent, mysql_decode_error, parse_ask_veloxy_json,
+        sqlite_decode_error, validate_generated_sql,
+    };
+    use crate::models::{QueryEditorColumn, QueryEditorMetadata, QueryEditorTable};
 
     #[test]
     fn mysql_decode_error_is_explicit() {
@@ -2280,5 +3041,51 @@ mod tests {
         assert!(message.contains("SQLite decode error"));
         assert!(message.contains("get_schema"));
         assert!(message.contains("name"));
+    }
+
+    #[test]
+    fn schema_context_is_bounded() {
+        let columns = (0..40)
+            .map(|idx| QueryEditorColumn {
+                name: format!("column_{}", idx),
+                data_type: "text".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let tables = (0..20)
+            .map(|idx| QueryEditorTable {
+                schema: "public".to_string(),
+                name: format!("events_{}", idx),
+                columns: columns.clone(),
+            })
+            .collect::<Vec<_>>();
+        let metadata = QueryEditorMetadata {
+            tables,
+            functions: Vec::new(),
+            truncated_tables: false,
+            truncated_columns: false,
+            truncated_functions: false,
+        };
+
+        let context = build_schema_context(&metadata, "show events", None);
+        assert!(!context.is_empty());
+        assert!(context.len() <= super::ASK_VELOXY_SCHEMA_CHAR_BUDGET);
+    }
+
+    #[test]
+    fn ask_veloxy_json_parser_handles_embedded_block() {
+        let content = "Here is the output {\"sql\":\"select 1\",\"intent\":\"select\",\"confidence\":0.9,\"warnings\":[]}";
+        let parsed = parse_ask_veloxy_json(content).expect("json should parse");
+        assert_eq!(parsed.get("sql").and_then(|v| v.as_str()), Some("select 1"));
+    }
+
+    #[test]
+    fn sql_validation_rejects_multi_statement() {
+        let multi = "select 1; select 2;";
+        assert!(validate_generated_sql(multi).is_err());
+    }
+
+    #[test]
+    fn sql_intent_classifier_recognizes_update() {
+        assert_eq!(classify_sql_intent("UPDATE foo SET bar = 1"), "update");
     }
 }

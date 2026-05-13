@@ -97,6 +97,40 @@ export type QueryEditorMetadata = {
   truncatedFunctions: boolean
 }
 
+export type AskVeloxyProviderConfig = {
+  apiKey: string
+  model: string
+  baseUrl?: string
+}
+
+export type AskVeloxyTableRef = {
+  schema: string
+  name: string
+}
+
+export type AskVeloxyRequest = {
+  connectionId?: string
+  naturalPrompt: string
+  targetTable?: AskVeloxyTableRef
+  providerConfig: AskVeloxyProviderConfig
+  maxRows?: number
+}
+
+export type AskVeloxyTokenStats = {
+  schemaChars: number
+  schemaTokensEstimate: number
+  promptChars: number
+  promptTokensEstimate: number
+}
+
+export type AskVeloxyResponse = {
+  sql: string
+  intent: string
+  confidence: number
+  warnings: string[]
+  tokenStats: AskVeloxyTokenStats
+}
+
 export type TableInfo = {
   schema: string
   name: string

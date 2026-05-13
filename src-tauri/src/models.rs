@@ -315,6 +315,61 @@ pub struct QueryEditorMetadata {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AskVeloxyProviderConfig {
+    pub api_key: String,
+    pub model: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskVeloxyTableRef {
+    pub schema: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskVeloxyRequest {
+    pub connection_id: Option<String>,
+    pub natural_prompt: String,
+    #[serde(default)]
+    pub target_table: Option<AskVeloxyTableRef>,
+    pub provider_config: AskVeloxyProviderConfig,
+    #[serde(default)]
+    pub max_rows: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskVeloxyTokenStats {
+    pub schema_chars: usize,
+    pub schema_tokens_estimate: usize,
+    pub prompt_chars: usize,
+    pub prompt_tokens_estimate: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskVeloxyResponse {
+    pub sql: String,
+    pub intent: String,
+    pub confidence: f64,
+    pub warnings: Vec<String>,
+    pub token_stats: AskVeloxyTokenStats,
+}
+
+#[derive(Debug, Clone)]
+pub struct AskVeloxyDbContextCache {
+    pub database_name: String,
+    pub engine: DatabaseEngine,
+    pub metadata: QueryEditorMetadata,
+    pub foreign_keys: Vec<ForeignKeyEdge>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LintSqlRequest {
     pub connection_id: Option<String>,
     pub sql: String,

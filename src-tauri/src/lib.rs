@@ -8,7 +8,7 @@ mod ssh_tunnel;
 use commands::{
   apply_table_properties, connect_db, delete_connection, disconnect_db, execute_ddl_statement,
   execute_ddl_transaction, export_diagram_png, export_results_csv_command,
-  export_results_json_command, get_foreign_keys, get_query_editor_metadata, get_schema,
+  export_results_json_command, generate_sql_from_nl, get_foreign_keys, get_query_editor_metadata, get_schema,
   get_table_indexes, get_table_properties, get_tables, lint_sql, list_connections_command,
   list_databases, ping_connection, run_query, save_base64_png, save_text_file,
   set_active_connection, switch_database,
@@ -69,7 +69,8 @@ pub fn run() {
       get_query_editor_metadata,
       save_base64_png,
       save_text_file,
-      lint_sql
+      lint_sql,
+      generate_sql_from_nl
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

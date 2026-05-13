@@ -4,6 +4,7 @@ import {
 	PlayIcon,
 	PlusIcon,
 	PlugIcon,
+	RobotIcon,
 	TextHIcon,
 	XIcon,
 } from "@phosphor-icons/react";
@@ -12,6 +13,7 @@ import { format } from "sql-formatter";
 import {
 	forwardRef,
 	type PointerEvent as ReactPointerEvent,
+	type ReactNode,
 	useCallback,
 	useEffect,
 	useImperativeHandle,
@@ -70,6 +72,7 @@ export type QueryWorkspaceHandle = {
 	/** Append SQL to the editor without executing (binds active connection when set). */
 	appendQuerySql: (sql: string) => void;
 	openTabWithSql: (sql: string) => void;
+	openTabWithSqlAndRun: (sql: string) => void;
 	runLastQuery: () => void;
 	refreshFocusedResults: () => void;
 	getHasLastQuery: () => boolean;
@@ -110,6 +113,7 @@ type QueryWorkspaceProps = {
 	insertTable: TableInfo | null;
 	canInsertRow: boolean;
 	onInsertRowSuccess: () => void;
+	askVeloxySidebar?: (onClose: () => void) => ReactNode;
 };
 
 function buildPersistSnapshot(state: QueryWorkspaceState) {
@@ -181,6 +185,8 @@ type QueryPaneProps = {
 	insertTable: TableInfo | null;
 	canInsertRow: boolean;
 	onInsertRowSuccess: () => void;
+	askVeloxySidebar?: ReactNode;
+	isAskVeloxyOpen: boolean;
 };
 
 function QueryPane({
@@ -216,6 +222,8 @@ function QueryPane({
 	insertTable,
 	canInsertRow,
 	onInsertRowSuccess,
+	askVeloxySidebar,
+	isAskVeloxyOpen,
 }: QueryPaneProps) {
 	const resultsTab = tab.resultsSubTab;
 	const runPending = tab.runInFlight;
@@ -227,16 +235,23 @@ function QueryPane({
 			aria-label="Query editor"
 		>
 			<section className="relative z-0 min-h-0 min-w-0 flex-1 overflow-hidden">
-				<div className="min-h-0 h-full min-w-0 overflow-hidden contain-[layout_paint]">
-					<SqlEditor
-						value={tab.sql}
-						isDark={isDark}
-						onChange={onSqlChange}
-						onRun={onRun}
-						onRunStatement={onRunStatement}
-						metadata={editorMetadata}
-						diagnostics={lintDiagnostics}
-					/>
+				<div className="flex h-full min-w-0 overflow-hidden">
+					<div className="min-h-0 h-full min-w-0 flex-1 overflow-hidden contain-[layout_paint]">
+						<SqlEditor
+							value={tab.sql}
+							isDark={isDark}
+							onChange={onSqlChange}
+							onRun={onRun}
+							onRunStatement={onRunStatement}
+							metadata={editorMetadata}
+							diagnostics={lintDiagnostics}
+						/>
+					</div>
+					{isAskVeloxyOpen && askVeloxySidebar ? (
+						<aside className="h-full w-[380px] shrink-0 border-l border-border">
+							{askVeloxySidebar}
+						</aside>
+					) : null}
 				</div>
 			</section>
 
@@ -442,6 +457,7 @@ export const QueryWorkspace = forwardRef<
 		insertTable,
 		canInsertRow,
 		onInsertRowSuccess,
+		askVeloxySidebar,
 	},
 	ref,
 ) {
@@ -583,6 +599,8 @@ export const QueryWorkspace = forwardRef<
 	const focusedTabId = getFocusedTabId(state);
 	const focusedTab = state.tabs[focusedTabId];
 	const [historyOpen, setHistoryOpen] = useState(false);
+	const [isAskVeloxyOpen, setIsAskVeloxyOpen] = useState(false);
+	const askVeloxyOpen = Boolean(connectionId) && isAskVeloxyOpen;
 	const [favorites, setFavorites] = useState<Set<string>>(() => {
 		try {
 			const stored = localStorage.getItem('veloxdb.queryFavorites');
@@ -744,6 +762,30 @@ export const QueryWorkspace = forwardRef<
 					connectionId: connectionId ?? null,
 				});
 			},
+			openTabWithSqlAndRun: (sql: string) => {
+				const trimmed = sql.trim();
+				if (!trimmed) return;
+				const targetId = connectionId ?? null;
+				if (!targetId) {
+					onRequestConnection();
+					return;
+				}
+				const tabId = crypto.randomUUID();
+				dispatch({
+					type: "addTabWithSql",
+					tabId,
+					sql: trimmed,
+					connectionId: targetId,
+				});
+				const flightId = 1;
+				dispatch({ type: "runStart", tabId, flightId });
+				runQueryMutation.mutate({
+					connectionId: targetId,
+					sql: trimmed,
+					tabId,
+					flightId,
+				});
+			},
 			setActiveTabConnection: (cid: string | null) => {
 				dispatch({ type: "setActiveTabConnection", connectionId: cid });
 			},
@@ -764,7 +806,7 @@ export const QueryWorkspace = forwardRef<
 				return Boolean(stateRef.current.tabs[tabId]?.lastExecutedSql?.trim());
 			},
 		}),
-		[runForTab, connectionId],
+		[runForTab, connectionId, onRequestConnection, runQueryMutation],
 	);
 
 	const handleToolbarRun = useCallback(() => {
@@ -806,10 +848,6 @@ export const QueryWorkspace = forwardRef<
 	useEffect(() => {
 		const onKeyDown = (event: KeyboardEvent) => {
 			const commandKey = event.metaKey || event.ctrlKey;
-			if (commandKey && event.key === "Enter") {
-				event.preventDefault();
-				handleToolbarRun();
-			}
 			if (commandKey && event.shiftKey && event.key === "F") {
 				event.preventDefault();
 				handleFormatSql();
@@ -817,7 +855,7 @@ export const QueryWorkspace = forwardRef<
 		};
 		window.addEventListener("keydown", onKeyDown);
 		return () => window.removeEventListener("keydown", onKeyDown);
-	}, [handleToolbarRun, handleFormatSql]);
+	}, [handleFormatSql]);
 
 	const activeTab = state.tabs[state.activeTabId];
 	const toolbarBusy = Boolean(
@@ -982,13 +1020,22 @@ export const QueryWorkspace = forwardRef<
 							onClick={handleToolbarRun}
 							disabled={toolbarBusy}
 							aria-label="Run query"
-							title="Run query (Cmd/Ctrl + Enter)"
+							title="Run query"
 						>
 							<PlayIcon weight="fill" />
 						</Button>
-						<span className="ml-1 hidden text-[11px] uppercase tracking-[0.16em] text-muted-foreground md:inline">
-							Cmd/Ctrl + Enter
-						</span>
+						<Button
+							variant={askVeloxyOpen ? "default" : "outline"}
+							size="sm"
+							onClick={() => setIsAskVeloxyOpen((prev) => !prev)}
+							disabled={!connectionId}
+							aria-label="Ask Veloxy"
+							title="Ask Veloxy"
+							className="gap-1.5"
+						>
+							<RobotIcon className="size-4" />
+							Ask Veloxy
+						</Button>
 					</div>
 				</div>
 			</div>
@@ -1048,6 +1095,12 @@ export const QueryWorkspace = forwardRef<
 					insertTable={insertTable}
 					canInsertRow={canInsertRow}
 					onInsertRowSuccess={onInsertRowSuccess}
+					askVeloxySidebar={
+						askVeloxySidebar
+							? askVeloxySidebar(() => setIsAskVeloxyOpen(false))
+							: undefined
+					}
+					isAskVeloxyOpen={askVeloxyOpen}
 				/>
 			) : null}
 			<QueryHistoryPanel

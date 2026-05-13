@@ -1,4 +1,6 @@
 import type {
+  AskVeloxyRequest,
+  AskVeloxyResponse,
   ColumnInfo,
   ColumnProperties,
   ConnectionInput,
@@ -32,6 +34,7 @@ export interface VeloxDbRepository {
   listConnections(): Promise<ConnectionSummary[]>
   setActiveConnection(connectionId: string): Promise<ConnectionSummary>
   runQuery(request: QueryRequest): Promise<QueryResult>
+  generateSqlFromNl(request: AskVeloxyRequest): Promise<AskVeloxyResponse>
   getQueryEditorMetadata(connectionId?: string): Promise<QueryEditorMetadata>
   lintSql(request: LintSqlRequest): Promise<LintSqlResult>
   getTables(connectionId?: string): Promise<TableInfo[]>
