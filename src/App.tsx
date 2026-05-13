@@ -20,12 +20,14 @@ import { CommandPalette } from "@/features/commands/components/CommandPalette";
 import { ShortcutSheet } from "@/features/commands/components/ShortcutSheet";
 import { SettingsDialog } from "@/features/commands/components/SettingsDialog";
 import { ConnectionDialog } from "@/features/connections/components/ConnectionDialog";
+import { RenameConnectionDialog } from "@/features/connections/components/RenameConnectionDialog";
 import { ConnectionsSidebarTree } from "@/features/connections/components/ConnectionsSidebarTree";
 import {
 	useActivateConnectionMutation,
 	useConnectionsQuery,
 	useConnectMutation,
 	useDeleteConnectionMutation,
+	useRenameConnectionMutation,
 } from "@/features/connections/queries";
 import { ModelWorkspace } from "@/features/model/components/ModelWorkspace";
 import { readOnboardingCompleted } from "@/features/onboarding/constants";
@@ -126,6 +128,7 @@ function VeloxApp() {
 	const [settingsOpen, setSettingsOpen] = useState(false)
 	const [commandPaletteOpen, setCommandPaletteOpen] = useState(false)
 	const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
+	const [renamingConnection, setRenamingConnection] = useState<ConnectionSummary | null>(null);
 	const [isSidebarCollapsed, setIsSidebarCollapsed] =
 		useState(readSidebarCollapsed);
 	const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
@@ -238,6 +241,12 @@ function VeloxApp() {
 				setTableSearch("");
 			}
 			notifySuccess("Connection deleted");
+		},
+	});
+
+	const renameConnectionMutation = useRenameConnectionMutation({
+		onError: (error) => {
+			notifyError(error, { category: "connection", force: true });
 		},
 	});
 
@@ -519,6 +528,30 @@ function VeloxApp() {
 		[connection?.engine],
 	);
 
+	const handleRenameConnectionRequest = useCallback(
+		(connectionTarget: ConnectionSummary) => {
+			setRenamingConnection(connectionTarget);
+		},
+		[],
+	);
+
+	const handleRenameConnectionConfirm = useCallback(
+		(connectionTarget: ConnectionSummary, newName: string) => {
+			renameConnectionMutation.mutate(
+				{ connectionId: connectionTarget.id, newName },
+				{
+					onSuccess: (updated) => {
+						if (connection?.id === updated.id) {
+							setConnection(updated);
+						}
+					},
+				},
+			);
+			setRenamingConnection(null);
+		},
+		[connection?.id, renameConnectionMutation],
+	);
+
 	const handleDisconnectConnectionRequest = useCallback(
 		(connectionTarget: ConnectionSummary) => {
 			const confirmed = window.confirm(
@@ -763,6 +796,7 @@ function VeloxApp() {
 									onTableQuickAction={handleTableQuickAction}
 									onRefreshConnection={handleRefreshConnection}
 									onRefreshTable={handleRefreshTable}
+									onRenameConnection={handleRenameConnectionRequest}
 									onDisconnectConnection={handleDisconnectConnectionRequest}
 									onRenameTable={handleRenameTableRequest}
 									onDeleteTable={handleDeleteTableRequest}
@@ -926,6 +960,13 @@ function VeloxApp() {
 					connectMutation.mutate(values);
 				}}
 				isPending={connectMutation.isPending}
+			/>
+
+			<RenameConnectionDialog
+				key={renamingConnection?.id ?? 'none'}
+				connection={renamingConnection}
+				onConfirm={handleRenameConnectionConfirm}
+				onCancel={() => setRenamingConnection(null)}
 			/>
 
 			<TablePropertiesDialog
