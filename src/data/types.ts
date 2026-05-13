@@ -116,6 +116,39 @@ export type AskVeloxyRequest = {
   maxRows?: number
 }
 
+export type AskVeloxyMode = 'chat' | 'action'
+export type AskVeloxyConversationRole = 'user' | 'assistant'
+
+export type AskVeloxyConversationMessage = {
+  id: string
+  role: AskVeloxyConversationRole
+  mode: AskVeloxyMode
+  text: string
+  createdAt: number
+  sqlDraft?: string
+}
+
+export type AskVeloxyChatRequest = {
+  connectionId?: string
+  naturalPrompt: string
+  targetTable?: AskVeloxyTableRef
+  providerConfig: AskVeloxyProviderConfig
+  maxRows?: number
+}
+
+export type AskVeloxyChatResponse = {
+  message: string
+  suggestions: string[]
+  warnings: string[]
+  sqlDraft?: string
+  needsSqlGeneration: boolean
+  needsClarification: boolean
+}
+
+export type AskVeloxyConversationResponse = {
+  messages: AskVeloxyConversationMessage[]
+}
+
 export type AskVeloxyTokenStats = {
   schemaChars: number
   schemaTokensEstimate: number
@@ -127,6 +160,8 @@ export type AskVeloxyResponse = {
   sql: string
   intent: string
   confidence: number
+  explanation?: string
+  suggestions?: string[]
   warnings: string[]
   tokenStats: AskVeloxyTokenStats
 }

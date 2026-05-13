@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
-use reqwest::Client;
 use serde_json::Value;
 use tauri::{AppHandle, State};
 use sqlx::{Column, Decode, Row, Type};
@@ -19,12 +18,14 @@ use crate::db::{
 };
 use crate::credentials;
 use crate::models::{
-    AskVeloxyDbContextCache, AskVeloxyRequest, AskVeloxyResponse, AskVeloxyTokenStats, AskVeloxyTableRef,
-    ColumnInfo, ColumnProperties, ConnectionInput, ConnectionSummary, DatabaseInfo, DdlBatchRequest,
-    DdlStatementRequest, ForeignKeyEdge, IndexInfo, QueryRequest, QueryResult, SchemaRequest,
-    LintSqlRequest, LintSqlResult, QueryEditorColumn, QueryEditorFunction, QueryEditorMetadata,
-    QueryEditorTable, SqlDiagnostic, StoredConnection, SwitchDatabaseRequest, TableIndexesResult,
-    TableInfo, TablePropertiesApplyRequest, DatabaseEngine,
+    AskVeloxyChatRequest, AskVeloxyChatResponse, AskVeloxyConversationMessage,
+    AskVeloxyConversationResponse, AskVeloxyDbContextCache, AskVeloxyRequest, AskVeloxyResponse,
+    AskVeloxyTableRef, AskVeloxyTokenStats, ColumnInfo, ColumnProperties, ConnectionInput,
+    ConnectionSummary, DatabaseInfo, DatabaseEngine, DdlBatchRequest, DdlStatementRequest,
+    ForeignKeyEdge, IndexInfo, LintSqlRequest, LintSqlResult, QueryEditorColumn,
+    QueryEditorFunction, QueryEditorMetadata, QueryEditorTable, QueryRequest, QueryResult,
+    SchemaRequest, SqlDiagnostic, StoredConnection, SwitchDatabaseRequest, TableIndexesResult,
+    TableInfo, TablePropertiesApplyRequest,
 };
 use crate::export::{
     DiagramExportRequest, ExportQueryRequest,
@@ -46,6 +47,7 @@ const ASK_VELOXY_MAX_CONTEXT_COLUMNS: usize = 18;
 const ASK_VELOXY_MAX_CONTEXT_RELATIONSHIPS: usize = 36;
 const ASK_VELOXY_SCHEMA_CHAR_BUDGET: usize = 6_000;
 const ASK_VELOXY_PROMPT_CHAR_BUDGET: usize = 12_000;
+const ASK_VELOXY_MAX_HISTORY_MESSAGES: usize = 30;
 
 fn mysql_decode_error(context: &str, column_name: &str, index: Option<usize>, detail: &str) -> String {
     match index {
@@ -1106,6 +1108,18 @@ fn ask_veloxy_context_cache_key(connection_id: &str, database_name: &str) -> Str
     format!("{}::{}", connection_id, database_name)
 }
 
+fn ask_veloxy_conversation_key(connection_id: &str, database_name: &str) -> String {
+    format!("{}::{}", connection_id, database_name)
+}
+
+fn now_epoch_seconds() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 async fn get_or_build_ask_veloxy_db_context(
     app: &AppHandle,
     state: &AppState,
@@ -1139,6 +1153,31 @@ async fn get_or_build_ask_veloxy_db_context(
         .await
         .insert(cache_key, cache.clone());
     Ok(cache)
+}
+
+fn extract_sql_draft_from_text(message: &str) -> Option<String> {
+    let lowered = message.to_lowercase();
+    let markers = ["select ", "with ", "insert ", "update ", "delete ", "explain "];
+    let start = markers
+        .iter()
+        .filter_map(|marker| lowered.find(marker))
+        .min()?;
+    let mut sql = message[start..].trim().to_string();
+    if let Some(idx) = sql.find("```") {
+        sql.truncate(idx);
+    }
+    if sql.ends_with('.') {
+        sql.pop();
+    }
+    if sql.is_empty() {
+        None
+    } else {
+        Some(sql)
+    }
+}
+
+fn parse_bool_field(value: &Value, field: &str, default: bool) -> bool {
+    value.get(field).and_then(Value::as_bool).unwrap_or(default)
 }
 
 #[tauri::command]
@@ -1600,6 +1639,273 @@ fn parse_ask_veloxy_json(content: &str) -> Result<Value, String> {
     }
 }
 
+fn parse_ask_veloxy_suggestions(generated: &Value) -> Vec<String> {
+    generated
+        .get("suggestions")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .take(5)
+                .map(|item| {
+                    let mut value = item.to_string();
+                    truncate_on_char_boundary(&mut value, 200);
+                    value
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_ask_veloxy_chat_json(content: &str) -> Result<Value, String> {
+    if let Ok(value) = serde_json::from_str::<Value>(content) {
+        return Ok(value);
+    }
+    let start = content.find('{');
+    let end = content.rfind('}');
+    match (start, end) {
+        (Some(start_idx), Some(end_idx)) if end_idx > start_idx => {
+            serde_json::from_str::<Value>(&content[start_idx..=end_idx])
+                .map_err(|error| format!("Ask Veloxy chat JSON was invalid: {}", error))
+        }
+        _ => Err("Ask Veloxy chat response did not contain JSON.".to_string()),
+    }
+}
+
+fn parse_chat_message(value: &Value) -> Option<String> {
+    value
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("reply").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+#[tauri::command]
+pub async fn chat_with_db(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: AskVeloxyChatRequest,
+) -> Result<AskVeloxyChatResponse, String> {
+    let natural_prompt = input.natural_prompt.trim();
+    if natural_prompt.is_empty() {
+        return Err("Ask Veloxy prompt cannot be empty.".to_string());
+    }
+    if input.provider_config.api_key.trim().is_empty() {
+        return Err("OpenRouter API key is required.".to_string());
+    }
+    if input.provider_config.model.trim().is_empty() {
+        return Err("OpenRouter model is required.".to_string());
+    }
+
+    let (connection_id, engine) =
+        resolve_connection_engine(&app, &state, input.connection_id.clone()).await?;
+    let stored_connection = load_connection(&app, &connection_id)?
+        .ok_or_else(|| "Stored connection details were not found.".to_string())?;
+    let db_context = get_or_build_ask_veloxy_db_context(&app, &state, &connection_id, engine).await?;
+    let schema_context = build_schema_context(&db_context, natural_prompt, input.target_table.as_ref());
+    let conversation_key = ask_veloxy_conversation_key(&connection_id, &stored_connection.database);
+    let history = state
+        .ask_veloxy_conversations
+        .read()
+        .await
+        .get(&conversation_key)
+        .cloned()
+        .unwrap_or_default();
+
+    let history_block = history
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .map(|message| format!("{}: {}", message.role, message.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut user_prompt = format!(
+        "Engine: {:?}\nDatabase: {}\nTask: {}\nMaxRows: {}\nRecentConversation:\n{}\nSchemaContext:\n{}\n",
+        db_context.engine,
+        db_context.database_name,
+        natural_prompt,
+        input.max_rows.unwrap_or(MAX_QUERY_ROWS),
+        history_block,
+        schema_context
+    );
+    truncate_on_char_boundary(&mut user_prompt, ASK_VELOXY_PROMPT_CHAR_BUDGET);
+
+    let system_prompt = "You are Ask Veloxy chat mode. Return JSON when possible with keys: message (string), suggestions (array of strings), sqlDraft (string optional), needsSqlGeneration (boolean), needsClarification (boolean), warnings (array of strings). If JSON is not possible, return helpful plain text.";
+    let base_url = normalize_openrouter_base(input.provider_config.base_url.as_deref());
+    let endpoint = format!("{}/chat/completions", base_url);
+    let client = state.openrouter_client.get_or_init(reqwest::Client::new);
+    let response = client
+        .post(&endpoint)
+        .header("Authorization", format!("Bearer {}", input.provider_config.api_key.trim()))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": input.provider_config.model.trim(),
+            "temperature": 0.2,
+            "max_tokens": 700,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt }
+            ]
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("OpenRouter request failed: {}", error))?;
+
+    let status = response.status();
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Invalid OpenRouter JSON response: {}", error))?;
+    if !status.is_success() {
+        let message = payload
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown OpenRouter error");
+        return Err(format!("OpenRouter error ({}): {}", status.as_u16(), message));
+    }
+
+    let message_content = extract_openrouter_message_content(&payload)?;
+    let (message, suggestions, warnings, sql_draft, needs_sql_generation, needs_clarification) =
+        match parse_ask_veloxy_chat_json(&message_content) {
+            Ok(value) => {
+                let message = parse_chat_message(&value).unwrap_or_else(|| message_content.trim().to_string());
+                let mut draft = value
+                    .get("sqlDraft")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("sql_draft").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string);
+                if draft.is_none() {
+                    draft = extract_sql_draft_from_text(&message);
+                }
+                let suggestions = value
+                    .get("suggestions")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                            .take(5)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let warnings = value
+                    .get("warnings")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let needs_sql_generation = parse_bool_field(&value, "needsSqlGeneration", draft.is_some());
+                let needs_clarification = parse_bool_field(&value, "needsClarification", false);
+                (
+                    message,
+                    suggestions,
+                    warnings,
+                    draft,
+                    needs_sql_generation,
+                    needs_clarification,
+                )
+            }
+            Err(_) => {
+                let draft = extract_sql_draft_from_text(&message_content);
+                let needs_sql_generation = draft.is_some();
+                (
+                    message_content.trim().to_string(),
+                    Vec::new(),
+                    vec!["Model returned non-JSON chat output. Parsed in tolerant mode.".to_string()],
+                    draft,
+                    needs_sql_generation,
+                    false,
+                )
+            }
+        };
+
+    {
+        let mut conversations = state.ask_veloxy_conversations.write().await;
+        let bucket = conversations.entry(conversation_key).or_default();
+        bucket.push(AskVeloxyConversationMessage {
+            id: format!("msg-{}", uuid::Uuid::new_v4()),
+            role: "user".to_string(),
+            mode: "chat".to_string(),
+            text: natural_prompt.to_string(),
+            created_at: now_epoch_seconds(),
+            sql_draft: None,
+        });
+        bucket.push(AskVeloxyConversationMessage {
+            id: format!("msg-{}", uuid::Uuid::new_v4()),
+            role: "assistant".to_string(),
+            mode: "chat".to_string(),
+            text: message.clone(),
+            created_at: now_epoch_seconds(),
+            sql_draft: sql_draft.clone(),
+        });
+        if bucket.len() > ASK_VELOXY_MAX_HISTORY_MESSAGES {
+            let remove_count = bucket.len() - ASK_VELOXY_MAX_HISTORY_MESSAGES;
+            bucket.drain(0..remove_count);
+        }
+    }
+
+    Ok(AskVeloxyChatResponse {
+        message,
+        suggestions,
+        warnings,
+        sql_draft,
+        needs_sql_generation,
+        needs_clarification,
+    })
+}
+
+#[tauri::command]
+pub async fn load_veloxy_conversation(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: Option<String>,
+) -> Result<AskVeloxyConversationResponse, String> {
+    let (resolved_connection_id, _) = resolve_connection_engine(&app, &state, connection_id).await?;
+    let stored_connection = load_connection(&app, &resolved_connection_id)?
+        .ok_or_else(|| "Stored connection details were not found.".to_string())?;
+    let key = ask_veloxy_conversation_key(&resolved_connection_id, &stored_connection.database);
+    let messages = state
+        .ask_veloxy_conversations
+        .read()
+        .await
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    Ok(AskVeloxyConversationResponse { messages })
+}
+
+#[tauri::command]
+pub async fn clear_veloxy_conversation(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: Option<String>,
+) -> Result<(), String> {
+    let (resolved_connection_id, _) = resolve_connection_engine(&app, &state, connection_id).await?;
+    let stored_connection = load_connection(&app, &resolved_connection_id)?
+        .ok_or_else(|| "Stored connection details were not found.".to_string())?;
+    let key = ask_veloxy_conversation_key(&resolved_connection_id, &stored_connection.database);
+    state.ask_veloxy_conversations.write().await.remove(&key);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn generate_sql_from_nl(
     app: AppHandle,
@@ -1632,11 +1938,11 @@ pub async fn generate_sql_from_nl(
     );
     truncate_on_char_boundary(&mut user_prompt, ASK_VELOXY_PROMPT_CHAR_BUDGET);
 
-    let system_prompt = "You are Ask Veloxy. Return JSON only with keys: sql (string), intent (string), confidence (number 0..1), warnings (array of strings). Generate exactly one SQL statement and never include markdown.";
+    let system_prompt = "You are Ask Veloxy. Return JSON only with keys: sql (string), intent (string), confidence (number 0..1), explanation (string), suggestions (array of short strings), warnings (array of strings). Generate exactly one SQL statement, keep explanation concise, and never include markdown.";
     let base_url = normalize_openrouter_base(input.provider_config.base_url.as_deref());
     let endpoint = format!("{}/chat/completions", base_url);
 
-    let client = Client::new();
+    let client = state.openrouter_client.get_or_init(reqwest::Client::new);
     let response = client
         .post(&endpoint)
         .header("Authorization", format!("Bearer {}", input.provider_config.api_key.trim()))
@@ -1700,6 +2006,17 @@ pub async fn generate_sql_from_nl(
         .and_then(Value::as_f64)
         .unwrap_or(0.6)
         .clamp(0.0, 1.0);
+    let explanation = generated
+        .get("explanation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let mut truncated = value.to_string();
+            truncate_on_char_boundary(&mut truncated, 350);
+            truncated
+        });
+    let suggestions = parse_ask_veloxy_suggestions(&generated);
 
     if intent != "select" {
         warnings.push("Generated SQL is not read-only. Review before execution.".to_string());
@@ -1719,6 +2036,8 @@ pub async fn generate_sql_from_nl(
         sql,
         intent,
         confidence,
+        explanation,
+        suggestions,
         warnings,
         token_stats,
     })

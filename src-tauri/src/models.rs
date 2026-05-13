@@ -341,6 +341,48 @@ pub struct AskVeloxyRequest {
     pub max_rows: Option<usize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskVeloxyConversationMessage {
+    pub id: String,
+    pub role: String,
+    pub mode: String,
+    pub text: String,
+    pub created_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_draft: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskVeloxyChatRequest {
+    pub connection_id: Option<String>,
+    pub natural_prompt: String,
+    #[serde(default)]
+    pub target_table: Option<AskVeloxyTableRef>,
+    pub provider_config: AskVeloxyProviderConfig,
+    #[serde(default)]
+    pub max_rows: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskVeloxyChatResponse {
+    pub message: String,
+    pub suggestions: Vec<String>,
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_draft: Option<String>,
+    pub needs_sql_generation: bool,
+    pub needs_clarification: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskVeloxyConversationResponse {
+    pub messages: Vec<AskVeloxyConversationMessage>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AskVeloxyTokenStats {
@@ -356,6 +398,10 @@ pub struct AskVeloxyResponse {
     pub sql: String,
     pub intent: String,
     pub confidence: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
     pub warnings: Vec<String>,
     pub token_stats: AskVeloxyTokenStats,
 }

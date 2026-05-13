@@ -15,7 +15,12 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { queryKeys } from "@/data/query-keys";
 import { veloxDbRepository } from "@/data/repositories";
-import type { ConnectionSummary, TableInfo } from "@/data/types";
+import type {
+	AskVeloxyChatResponse,
+	AskVeloxyConversationResponse,
+	ConnectionSummary,
+	TableInfo,
+} from "@/data/types";
 import { CommandPalette } from "@/features/commands/components/CommandPalette";
 import { ShortcutSheet } from "@/features/commands/components/ShortcutSheet";
 import { SettingsDialog } from "@/features/commands/components/SettingsDialog";
@@ -729,8 +734,56 @@ function VeloxApp() {
 		queryWorkspaceRef.current?.refreshFocusedResults();
 	};
 
-	const handleAskVeloxySubmit = useCallback(
-		async (naturalPrompt: string): Promise<AskVeloxySubmitResult> => {
+	const handleAskVeloxyChatSubmit = async (
+		naturalPrompt: string,
+	): Promise<AskVeloxyChatResponse> => {
+			if (!connection?.id) {
+				const message = "Select a connection before using Ask Veloxy.";
+				setAskVeloxyError(message);
+				throw new Error(message);
+			}
+			if (!veloxyOpenRouterApiKey.trim()) {
+				const message = "Add your OpenRouter API key in Settings → Veloxy.";
+				setAskVeloxyError(message);
+				throw new Error(message);
+			}
+			if (!veloxyModel.trim()) {
+				const message = "Choose a Veloxy model in Settings → Veloxy.";
+				setAskVeloxyError(message);
+				throw new Error(message);
+			}
+			setAskVeloxyPending(true);
+			setAskVeloxyError(null);
+			try {
+				return await veloxDbRepository.chatWithDb({
+					connectionId: connection.id,
+					naturalPrompt,
+					targetTable: selectedTable
+						? { schema: selectedTable.schema, name: selectedTable.name }
+						: undefined,
+					providerConfig: {
+						apiKey: veloxyOpenRouterApiKey,
+						model: veloxyModel,
+						baseUrl: veloxyBaseUrl,
+					},
+					maxRows: useSettings.getState().maxQueryRows,
+				});
+			} catch (error) {
+				const message =
+					error instanceof Error
+						? error.message
+						: "Ask Veloxy chat failed.";
+				setAskVeloxyError(message);
+				notifyError(error, { category: "query", title: "Ask Veloxy chat failed" });
+				throw error instanceof Error ? error : new Error(message);
+			} finally {
+				setAskVeloxyPending(false);
+			}
+	};
+
+	const handleAskVeloxyActionSubmit = async (
+		naturalPrompt: string,
+	): Promise<AskVeloxySubmitResult> => {
 			if (!connection?.id) {
 				const message = "Select a connection before using Ask Veloxy.";
 				setAskVeloxyError(message);
@@ -800,15 +853,35 @@ function VeloxApp() {
 			} finally {
 				setAskVeloxyPending(false);
 			}
-		},
-		[
-			connection?.id,
-			selectedTable,
-			veloxyBaseUrl,
-			veloxyModel,
-			veloxyOpenRouterApiKey,
-		],
-	);
+	};
+
+	const handleLoadVeloxyConversation = async (): Promise<AskVeloxyConversationResponse> => {
+		if (!connection?.id) return { messages: [] };
+		try {
+			return await veloxDbRepository.loadVeloxyConversation(connection.id);
+		} catch (error) {
+			const message =
+				error instanceof Error
+					? error.message
+					: "Failed to load Ask Veloxy conversation.";
+			setAskVeloxyError(message);
+			return { messages: [] };
+		}
+	};
+
+	const handleClearVeloxyConversation = async () => {
+		if (!connection?.id) return;
+		try {
+			await veloxDbRepository.clearVeloxyConversation(connection.id);
+		} catch (error) {
+			const message =
+				error instanceof Error
+					? error.message
+					: "Failed to clear Ask Veloxy conversation.";
+			setAskVeloxyError(message);
+			throw error;
+		}
+	};
 
 
 	return (
@@ -987,7 +1060,10 @@ function VeloxApp() {
 								onOpenSettings={() => {
 									setSettingsOpen(true);
 								}}
-								onSubmit={handleAskVeloxySubmit}
+								onChatSubmit={handleAskVeloxyChatSubmit}
+								onActionSubmit={handleAskVeloxyActionSubmit}
+								onLoadConversation={handleLoadVeloxyConversation}
+								onClearConversation={handleClearVeloxyConversation}
 								onConfirmRun={async (sql) => {
 									queryWorkspaceRef.current?.openTabWithSqlAndRun(sql);
 									notifySuccess("Veloxy query executed");

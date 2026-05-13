@@ -1,4 +1,7 @@
 import type {
+  AskVeloxyChatRequest,
+  AskVeloxyChatResponse,
+  AskVeloxyConversationResponse,
   AskVeloxyRequest,
   AskVeloxyResponse,
   ColumnInfo,
@@ -34,6 +37,9 @@ export interface VeloxDbRepository {
   listConnections(): Promise<ConnectionSummary[]>
   setActiveConnection(connectionId: string): Promise<ConnectionSummary>
   runQuery(request: QueryRequest): Promise<QueryResult>
+  chatWithDb(request: AskVeloxyChatRequest): Promise<AskVeloxyChatResponse>
+  loadVeloxyConversation(connectionId?: string): Promise<AskVeloxyConversationResponse>
+  clearVeloxyConversation(connectionId?: string): Promise<void>
   generateSqlFromNl(request: AskVeloxyRequest): Promise<AskVeloxyResponse>
   getQueryEditorMetadata(connectionId?: string): Promise<QueryEditorMetadata>
   lintSql(request: LintSqlRequest): Promise<LintSqlResult>

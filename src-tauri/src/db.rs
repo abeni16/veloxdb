@@ -14,7 +14,8 @@ use tokio_postgres::NoTls;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::models::{
-    AskVeloxyDbContextCache, ConnectionInput, ConnectionSslMode, ConnectionSummary, DatabaseEngine, StoredConnection,
+    AskVeloxyConversationMessage, AskVeloxyDbContextCache, ConnectionInput, ConnectionSslMode,
+    ConnectionSummary, DatabaseEngine, StoredConnection,
 };
 use crate::ssh_tunnel::SshTunnel;
 use crate::credentials;
@@ -47,6 +48,8 @@ pub struct AppState {
     pub active_connection_id: RwLock<Option<String>>,
     pub ssh_tunnels: RwLock<HashMap<String, SshTunnel>>,
     pub ask_veloxy_db_context_cache: RwLock<HashMap<String, AskVeloxyDbContextCache>>,
+    pub ask_veloxy_conversations: RwLock<HashMap<String, Vec<AskVeloxyConversationMessage>>>,
+    pub openrouter_client: OnceLock<reqwest::Client>,
 }
 
 fn load_pem_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -308,6 +311,11 @@ pub async fn drop_pool(state: &AppState, connection_id: &str) {
         .write()
         .await
         .retain(|cache_key, _| !cache_key.starts_with(&format!("{}::", connection_id)));
+    state
+        .ask_veloxy_conversations
+        .write()
+        .await
+        .retain(|conversation_key, _| !conversation_key.starts_with(&format!("{}::", connection_id)));
     if let Some(mut tunnel) = state.ssh_tunnels.write().await.remove(connection_id) {
         tunnel.close().await;
     }
