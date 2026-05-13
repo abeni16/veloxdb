@@ -61,6 +61,8 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          cache-bin: false
+          prefix-key: v2-desktop
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -75,10 +77,17 @@ jobs:
       - name: Install JavaScript dependencies
         run: pnpm install --frozen-lockfile
 
-      # Do not use `pnpm run tauri:build -- ...`: pnpm inserts `--` before forwarded args,
-      # so Tauri treats `--bundles` as cargo arguments. Call the CLI directly instead.
+      # Use `pnpm exec tauri` (not `pnpm run tauri:build -- …`): pnpm inserts `--`, which makes
+      # Tauri forward flags to Cargo. Bash + ~/.cargo/env + ~/.cargo/bin first avoids a bad
+      # `cargo` on PATH after rust-cache (macOS: rustup-init / metadata errors).
       - name: Build Tauri app
-        run: pnpm exec tauri build -b "${{ matrix.bundles }}"
+        shell: bash
+        run: |
+          if [ -f "${HOME}/.cargo/env" ]; then
+            . "${HOME}/.cargo/env"
+          fi
+          export PATH="${HOME}/.cargo/bin:${PATH}"
+          pnpm exec tauri build -b "${{ matrix.bundles }}"
 
       - name: Upload desktop bundles
         uses: actions/upload-artifact@v4
