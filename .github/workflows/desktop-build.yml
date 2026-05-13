@@ -75,8 +75,10 @@ jobs:
       - name: Install JavaScript dependencies
         run: pnpm install --frozen-lockfile
 
+      # Do not use `pnpm run tauri:build -- ...`: pnpm inserts `--` before forwarded args,
+      # so Tauri treats `--bundles` as cargo arguments. Call the CLI directly instead.
       - name: Build Tauri app
-        run: pnpm tauri:build -- --bundles ${{ matrix.bundles }}
+        run: pnpm exec tauri build -b "${{ matrix.bundles }}"
 
       - name: Upload desktop bundles
         uses: actions/upload-artifact@v4
