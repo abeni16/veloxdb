@@ -11,6 +11,7 @@ import {
   InfoIcon,
   ArrowSquareOutIcon,
   ArrowsClockwiseIcon,
+  BellIcon,
 } from '@phosphor-icons/react'
 import { useCallback, useEffect, useState } from 'react'
 
@@ -31,6 +32,7 @@ const tabs = [
   { id: 'results', label: 'Results', Icon: TableIcon },
   { id: 'connections', label: 'Connections', Icon: PlugIcon },
   { id: 'veloxy', label: 'Veloxy', Icon: SparkleIcon },
+  { id: 'notifications', label: 'Notifications', Icon: BellIcon },
   { id: 'data', label: 'Data', Icon: DatabaseIcon },
   { id: 'about', label: 'About', Icon: InfoIcon },
 ]
@@ -91,10 +93,11 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
   const refreshOpenRouterModels = useCallback(async () => {
     setModelsStatus('loading')
     setModelsError(null)
+    const { veloxyOpenRouterApiKey, veloxyBaseUrl } = useSettings.getState()
     try {
       const options = await fetchOpenRouterModels(
-        settings.veloxyOpenRouterApiKey,
-        settings.veloxyBaseUrl,
+        veloxyOpenRouterApiKey,
+        veloxyBaseUrl,
       )
       setModelOptions(options)
       setModelsStatus('idle')
@@ -103,13 +106,17 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
       setModelsError(error instanceof Error ? error.message : 'Failed to fetch models')
       setModelOptions(OPENROUTER_POPULAR_MODELS)
     }
-  }, [settings.veloxyBaseUrl, settings.veloxyOpenRouterApiKey])
+  }, [])
 
-  useEffect(() => {
-    if (tab === 'veloxy' && settings.veloxyOpenRouterApiKey.trim()) {
-      void refreshOpenRouterModels()
-    }
-  }, [tab, settings.veloxyOpenRouterApiKey, refreshOpenRouterModels])
+  const selectSettingsTab = useCallback(
+    (id: string) => {
+      setTab(id)
+      if (id === 'veloxy' && useSettings.getState().veloxyOpenRouterApiKey.trim()) {
+        void refreshOpenRouterModels()
+      }
+    },
+    [refreshOpenRouterModels],
+  )
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -129,7 +136,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
               <button
                 key={id}
                 type="button"
-                onClick={() => setTab(id)}
+                onClick={() => selectSettingsTab(id)}
                 className={cn(
                   'flex items-center gap-2.5 px-4 py-2.5 text-left text-xs transition-colors',
                   tab === id
@@ -207,7 +214,11 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
                 <Input
                   type="password"
                   value={settings.veloxyOpenRouterApiKey}
-                  onChange={(e) => useSettings.setState({ veloxyOpenRouterApiKey: e.target.value })}
+                  onChange={(e) => {
+                    const value = e.target.value
+                    useSettings.setState({ veloxyOpenRouterApiKey: value })
+                    if (value.trim()) void refreshOpenRouterModels()
+                  }}
                   className="h-8 w-[260px] text-[11px]"
                   placeholder="sk-or-v1-..."
                   spellCheck={false}
@@ -216,7 +227,12 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
               <Field label="Base URL" desc="Advanced: custom OpenRouter-compatible endpoint.">
                 <Input
                   value={settings.veloxyBaseUrl}
-                  onChange={(e) => useSettings.setState({ veloxyBaseUrl: e.target.value })}
+                  onChange={(e) => {
+                    useSettings.setState({ veloxyBaseUrl: e.target.value })
+                    if (useSettings.getState().veloxyOpenRouterApiKey.trim()) {
+                      void refreshOpenRouterModels()
+                    }
+                  }}
                   className="h-8 w-[260px] text-[11px]"
                   placeholder="https://openrouter.ai/api/v1"
                   spellCheck={false}
@@ -247,6 +263,21 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
               {modelsError ? (
                 <p className="text-[11px] text-destructive">{modelsError}</p>
               ) : null}
+            </Section>}
+
+            {tab === 'notifications' && <Section title="Notifications">
+              <Field label="Success toasts" desc="Show success confirmation toasts.">
+                <Toggle
+                  value={settings.toastLevels.success}
+                  onChange={(v) => useSettings.setState({ toastLevels: { ...settings.toastLevels, success: v } })}
+                />
+              </Field>
+              <Field label="Error toasts" desc="Show error toasts when operations fail.">
+                <Toggle
+                  value={settings.toastLevels.error}
+                  onChange={(v) => useSettings.setState({ toastLevels: { ...settings.toastLevels, error: v } })}
+                />
+              </Field>
             </Section>}
 
             {tab === 'data' && <Section title="Data">

@@ -5,6 +5,9 @@ export type AppTheme = 'system' | 'light' | 'dark'
 export type FontSize = 'sm' | 'md' | 'lg'
 export type NullDisplay = 'null' | 'NULL' | 'dash' | 'empty'
 
+export type ToastLevel = 'success' | 'error'
+export type ToastLevels = Record<ToastLevel, boolean>
+
 export type AppSettings = {
   theme: AppTheme
   fontSize: FontSize
@@ -20,6 +23,7 @@ export type AppSettings = {
   veloxyOpenRouterApiKey: string
   veloxyModel: string
   veloxyBaseUrl: string
+  toastLevels: ToastLevels
 }
 
 const defaults: AppSettings = {
@@ -37,6 +41,7 @@ const defaults: AppSettings = {
   veloxyOpenRouterApiKey: '',
   veloxyModel: 'deepseek/deepseek-chat',
   veloxyBaseUrl: 'https://openrouter.ai/api/v1',
+  toastLevels: { success: true, error: true },
 }
 
 export const useSettings = create<AppSettings>()(
