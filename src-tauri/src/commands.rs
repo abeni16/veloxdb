@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
+use futures_util::StreamExt;
 use serde_json::Value;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use sqlx::{Column, Decode, Row, Type};
 use sqlx::mysql::{MySql, MySqlRow};
 use sqlx::sqlite::{Sqlite, SqliteRow};
-use tokio_postgres::error::ErrorPosition;
 use tokio_postgres::SimpleQueryMessage;
 use uuid::Uuid;
 
@@ -14,9 +16,12 @@ use crate::db::{
     build_mysql_pool, build_mysql_pool_custom, build_pool, build_pool_custom, build_sqlite_pool,
     disconnect_connection, drop_pool, get_or_create_mysql_pool, get_or_create_sqlite_pool,
     list_connections, load_connection, persist_connection_with_password, quote_identifier,
-    resolve_connection_engine, with_pool_client_retry, AppState, DEFAULT_MYSQL_PORT, MAX_QUERY_ROWS,
+    refresh_connection_pools, resolve_connection_engine, with_pool_client_retry, AppState,
+    DEFAULT_MYSQL_PORT, MAX_QUERY_ROWS,
 };
 use crate::credentials;
+use crate::pg_error::{error_line_column, map_pg_err};
+use crate::sql_split::split_sql_statements;
 use crate::models::{
     AskVeloxyChatRequest, AskVeloxyChatResponse, AskVeloxyConversationMessage,
     AskVeloxyConversationResponse, AskVeloxyDbContextCache, AskVeloxyRequest, AskVeloxyResponse,
@@ -25,7 +30,7 @@ use crate::models::{
     ForeignKeyEdge, IndexInfo, LintSqlRequest, LintSqlResult, QueryEditorColumn,
     QueryEditorFunction, QueryEditorMetadata, QueryEditorTable, QueryRequest, QueryResult,
     SchemaRequest, SqlDiagnostic, StoredConnection, SwitchDatabaseRequest, TableIndexesResult,
-    TableInfo, TablePropertiesApplyRequest,
+    TableInfo, TablePropertiesApplyRequest, VeloxyStreamChunk,
 };
 use crate::export::{
     DiagramExportRequest, ExportQueryRequest,
@@ -75,44 +80,6 @@ fn sqlite_decode_error(context: &str, column_name: &str, index: Option<usize>, d
     }
 }
 
-fn byte_offset_to_line_col(sql: &str, byte_offset: usize) -> Option<(usize, usize)> {
-    if byte_offset == 0 || byte_offset > sql.len() {
-        return None;
-    }
-    let mut line = 1usize;
-    let mut column = 1usize;
-    for ch in sql[..byte_offset].chars() {
-        if ch == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
-    }
-    Some((line, column))
-}
-
-fn lint_error_range(error: &tokio_postgres::Error, sql: &str) -> (Option<usize>, Option<usize>) {
-    let Some(db_error) = error.as_db_error() else {
-        return (None, None);
-    };
-    match db_error.position() {
-        Some(ErrorPosition::Original(position)) => {
-            let byte_offset = (*position as usize).saturating_sub(1);
-            byte_offset_to_line_col(sql, byte_offset)
-                .map(|(line, col)| (Some(line), Some(col)))
-                .unwrap_or((None, None))
-        }
-        Some(ErrorPosition::Internal { position, .. }) => {
-            let byte_offset = (*position as usize).saturating_sub(1);
-            byte_offset_to_line_col(sql, byte_offset)
-                .map(|(line, col)| (Some(line), Some(col)))
-                .unwrap_or((None, None))
-        }
-        None => (None, None),
-    }
-}
-
 fn mysql_get_idx<T>(row: &MySqlRow, index: usize, column_name: &str, context: &str) -> Result<T, String>
 where
     for<'r> T: Decode<'r, MySql> + Type<MySql>,
@@ -141,7 +108,65 @@ where
     })
 }
 
+fn database_name_from_mysql_value(
+    value: Option<String>,
+    context: &str,
+) -> Result<String, String> {
+    let name = value
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{context} returned an empty database name"))?;
+    Ok(name)
+}
+
+fn mysql_database_name_from_row(row: &MySqlRow, context: &str) -> Result<String, String> {
+    let value = mysql_value_to_string(row, 0, "Database", context)?;
+    database_name_from_mysql_value(value, context)
+}
+
 fn mysql_value_to_string(row: &MySqlRow, index: usize, column_name: &str, context: &str) -> Result<Option<String>, String> {
+    if let Ok(value) = row.try_get::<Option<String>, _>(index) {
+        return Ok(value);
+    }
+    if let Ok(value) = row.try_get::<Option<i64>, _>(index) {
+        return Ok(value.map(|v| v.to_string()));
+    }
+    if let Ok(value) = row.try_get::<Option<i32>, _>(index) {
+        return Ok(value.map(|v| v.to_string()));
+    }
+    if let Ok(value) = row.try_get::<Option<u64>, _>(index) {
+        return Ok(value.map(|v| v.to_string()));
+    }
+    if let Ok(value) = row.try_get::<Option<f64>, _>(index) {
+        return Ok(value.map(|v| v.to_string()));
+    }
+    if let Ok(value) = row.try_get::<Option<f32>, _>(index) {
+        return Ok(value.map(|v| v.to_string()));
+    }
+    if let Ok(value) = row.try_get::<Option<bool>, _>(index) {
+        return Ok(value.map(|v| v.to_string()));
+    }
+    if let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(index) {
+        return Ok(value.map(|v| decode_mysql_bytes_as_string(&v)));
+    }
+    Err(mysql_decode_error(
+        context,
+        column_name,
+        Some(index),
+        "unsupported value type",
+    ))
+}
+
+fn decode_mysql_bytes_as_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Like [`mysql_value_to_string`] but encodes raw bytes as hex (for ad-hoc query grids).
+fn mysql_value_to_display_string(
+    row: &MySqlRow,
+    index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<String>, String> {
     if let Ok(value) = row.try_get::<Option<String>, _>(index) {
         return Ok(value);
     }
@@ -174,6 +199,22 @@ fn mysql_value_to_string(row: &MySqlRow, index: usize, column_name: &str, contex
     ))
 }
 
+fn mysql_get_string(row: &MySqlRow, index: usize, column_name: &str, context: &str) -> Result<String, String> {
+    let value = mysql_value_to_string(row, index, column_name, context)?;
+    value.ok_or_else(|| {
+        mysql_decode_error(context, column_name, Some(index), "unexpected null value")
+    })
+}
+
+fn mysql_get_optional_string(
+    row: &MySqlRow,
+    index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<String>, String> {
+    mysql_value_to_string(row, index, column_name, context)
+}
+
 fn sqlite_value_to_string(row: &SqliteRow, index: usize, column_name: &str, context: &str) -> Result<Option<String>, String> {
     if let Ok(value) = row.try_get::<Option<String>, _>(index) {
         return Ok(value);
@@ -198,6 +239,70 @@ fn sqlite_value_to_string(row: &SqliteRow, index: usize, column_name: &str, cont
     ))
 }
 
+fn is_row_returning_sql(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    let upper = trimmed.to_uppercase();
+    upper.starts_with("SELECT")
+        || upper.starts_with("WITH")
+        || upper.starts_with("SHOW")
+        || upper.starts_with("EXPLAIN")
+        || upper.starts_with("DESCRIBE")
+        || upper.starts_with("DESC")
+        || upper.starts_with("PRAGMA")
+        || upper.starts_with("VALUES")
+        || upper.starts_with("TABLE ")
+}
+
+fn map_mysql_rows(
+    rows: Vec<MySqlRow>,
+    max_query_rows: usize,
+) -> Result<(Vec<String>, Vec<BTreeMap<String, Option<String>>>, usize, bool), String> {
+    let mut columns: Vec<String> = Vec::new();
+    if let Some(first) = rows.first() {
+        columns = first
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect();
+    }
+    let total_rows = rows.len();
+    let mut mapped_rows = Vec::new();
+    for row in rows.into_iter().take(max_query_rows) {
+        let mut mapped_row = BTreeMap::new();
+        for (index, column_name) in columns.iter().enumerate() {
+            let value = mysql_value_to_display_string(&row, index, column_name, "run_query")?;
+            mapped_row.insert(column_name.clone(), value);
+        }
+        mapped_rows.push(mapped_row);
+    }
+    Ok((columns, mapped_rows, total_rows, total_rows > max_query_rows))
+}
+
+fn map_sqlite_rows(
+    rows: Vec<SqliteRow>,
+    max_query_rows: usize,
+) -> Result<(Vec<String>, Vec<BTreeMap<String, Option<String>>>, usize, bool), String> {
+    let mut columns: Vec<String> = Vec::new();
+    if let Some(first) = rows.first() {
+        columns = first
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect();
+    }
+    let total_rows = rows.len();
+    let mut mapped_rows = Vec::new();
+    for row in rows.into_iter().take(max_query_rows) {
+        let mut mapped_row = BTreeMap::new();
+        for (index, column_name) in columns.iter().enumerate() {
+            let value = sqlite_value_to_string(&row, index, column_name, "run_query")?;
+            mapped_row.insert(column_name.clone(), value);
+        }
+        mapped_rows.push(mapped_row);
+    }
+    Ok((columns, mapped_rows, total_rows, total_rows > max_query_rows))
+}
+
 async fn run_query_mysql_or_sqlite(
     app: &AppHandle,
     state: &AppState,
@@ -207,77 +312,97 @@ async fn run_query_mysql_or_sqlite(
     engine: DatabaseEngine,
 ) -> Result<QueryResult, String> {
     let started_at = Instant::now();
+    let statements = split_sql_statements(sql);
+    if statements.is_empty() {
+        return Err("Enter a SQL statement before running the query.".to_string());
+    }
+
+    let mut columns = Vec::new();
+    let mut rows = Vec::new();
+    let mut total_rows = 0usize;
+    let mut truncated = false;
+    let mut command_tag: Option<u64> = None;
+
     match engine {
         DatabaseEngine::Mysql => {
             let pool = get_or_create_mysql_pool(app, state, connection_id).await?;
-            let rows = sqlx::query(sql)
-                .fetch_all(&pool)
+            let mut conn = pool
+                .acquire()
                 .await
                 .map_err(|error| error.to_string())?;
-            let mut columns: Vec<String> = Vec::new();
-            if let Some(first) = rows.first() {
-                columns = first
-                    .columns()
-                    .iter()
-                    .map(|column| column.name().to_string())
-                    .collect();
-            }
-            let total_rows = rows.len();
-            let mut mapped_rows = Vec::new();
-            for row in rows.into_iter().take(max_query_rows) {
-                let mut mapped_row = BTreeMap::new();
-                for (index, column_name) in columns.iter().enumerate() {
-                    let value = mysql_value_to_string(&row, index, column_name, "run_query")?;
-                    mapped_row.insert(column_name.clone(), value);
+            for statement in statements {
+                if is_row_returning_sql(&statement) {
+                    let fetched = sqlx::query(&statement)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let mapped = map_mysql_rows(fetched, max_query_rows)?;
+                    columns = mapped.0;
+                    rows = mapped.1;
+                    total_rows = mapped.2;
+                    truncated = mapped.3;
+                    command_tag = None;
+                } else {
+                    let result = sqlx::query(&statement)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let affected = result.rows_affected();
+                    command_tag = Some(affected);
+                    if rows.is_empty() {
+                        total_rows = affected as usize;
+                    }
                 }
-                mapped_rows.push(mapped_row);
             }
-
-            Ok(QueryResult {
-                columns,
-                row_count: mapped_rows.len(),
-                rows: mapped_rows,
-                execution_ms: started_at.elapsed().as_millis(),
-                truncated: total_rows > max_query_rows,
-                command_tag: None,
-            })
         }
         DatabaseEngine::Sqlite => {
             let pool = get_or_create_sqlite_pool(app, state, connection_id).await?;
-            let rows = sqlx::query(sql)
-                .fetch_all(&pool)
+            let mut conn = pool
+                .acquire()
                 .await
                 .map_err(|error| error.to_string())?;
-            let mut columns: Vec<String> = Vec::new();
-            if let Some(first) = rows.first() {
-                columns = first
-                    .columns()
-                    .iter()
-                    .map(|column| column.name().to_string())
-                    .collect();
-            }
-            let total_rows = rows.len();
-            let mut mapped_rows = Vec::new();
-            for row in rows.into_iter().take(max_query_rows) {
-                let mut mapped_row = BTreeMap::new();
-                for (index, column_name) in columns.iter().enumerate() {
-                    let value = sqlite_value_to_string(&row, index, column_name, "run_query")?;
-                    mapped_row.insert(column_name.clone(), value);
+            for statement in statements {
+                if is_row_returning_sql(&statement) {
+                    let fetched = sqlx::query(&statement)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let mapped = map_sqlite_rows(fetched, max_query_rows)?;
+                    columns = mapped.0;
+                    rows = mapped.1;
+                    total_rows = mapped.2;
+                    truncated = mapped.3;
+                    command_tag = None;
+                } else {
+                    let result = sqlx::query(&statement)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let affected = result.rows_affected();
+                    command_tag = Some(affected);
+                    if rows.is_empty() {
+                        total_rows = affected as usize;
+                    }
                 }
-                mapped_rows.push(mapped_row);
             }
-
-            Ok(QueryResult {
-                columns,
-                row_count: mapped_rows.len(),
-                rows: mapped_rows,
-                execution_ms: started_at.elapsed().as_millis(),
-                truncated: total_rows > max_query_rows,
-                command_tag: None,
-            })
         }
-        DatabaseEngine::Postgres => Err("Internal engine routing error.".to_string()),
+        DatabaseEngine::Postgres => {
+            return Err("Internal engine routing error.".to_string());
+        }
     }
+
+    Ok(QueryResult {
+        columns,
+        row_count: if rows.is_empty() {
+            total_rows
+        } else {
+            rows.len()
+        },
+        rows,
+        execution_ms: started_at.elapsed().as_millis(),
+        truncated,
+        command_tag,
+    })
 }
 
 #[tauri::command]
@@ -323,7 +448,7 @@ pub async fn connect_db(
 
             if let Err(e) = client.simple_query("select 1").await {
                 drop_pool(&state, &connection_id).await;
-                return Err(e.to_string());
+                return Err(map_pg_err(e, None));
             }
 
             state
@@ -407,7 +532,7 @@ pub async fn set_active_connection(
                 client
                     .simple_query("select 1")
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| map_pg_err(error, None))?;
                 Ok(())
             })
             .await?;
@@ -472,6 +597,15 @@ pub async fn ping_connection(
 }
 
 #[tauri::command]
+pub async fn refresh_connection(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<(), String> {
+    refresh_connection_pools(&app, &state, &connection_id).await
+}
+
+#[tauri::command]
 pub async fn disconnect_db(
     state: State<'_, AppState>,
     connection_id: String,
@@ -521,7 +655,7 @@ pub async fn list_databases(
                         &[],
                     )
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| map_pg_err(error, None))?;
 
                 Ok(rows
                     .into_iter()
@@ -539,11 +673,12 @@ pub async fn list_databases(
                 .fetch_all(&pool)
                 .await
                 .map_err(|error| error.to_string())?;
-            Ok(rows
-                .into_iter()
-                .filter_map(|row| row.try_get::<String, _>(0).ok())
-                .map(|name| DatabaseInfo { name })
-                .collect())
+            let mut databases = Vec::with_capacity(rows.len());
+            for row in rows {
+                let name = mysql_database_name_from_row(&row, "list_databases")?;
+                databases.push(DatabaseInfo { name });
+            }
+            Ok(databases)
         }
         DatabaseEngine::Sqlite => Ok(vec![DatabaseInfo {
             name: "main".to_string(),
@@ -604,7 +739,7 @@ pub async fn switch_database(
 
             if let Err(e) = client.simple_query("select 1").await {
                 drop_pool(&state, &input.connection_id).await;
-                return Err(e.to_string());
+                return Err(map_pg_err(e, None));
             }
 
             state
@@ -680,7 +815,7 @@ pub async fn run_query(
                 let messages = client
                     .simple_query(&sql)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| map_pg_err(error, Some(sql.as_str())))?;
 
                 let mut columns = Vec::new();
                 let mut rows = Vec::new();
@@ -750,16 +885,21 @@ async fn fetch_query_editor_metadata_for_connection(
 ) -> Result<QueryEditorMetadata, String> {
     if engine == DatabaseEngine::Mysql {
         let pool = get_or_create_mysql_pool(app, state, connection_id).await?;
+        let database = load_connection(app, connection_id)?
+            .map(|connection| connection.database)
+            .unwrap_or_default();
         let table_rows = sqlx::query(
             "
             select table_schema, table_name
             from information_schema.tables
             where table_type = 'BASE TABLE'
+              and table_schema = ?
               and table_schema not in ('information_schema', 'mysql', 'performance_schema', 'sys')
             order by table_schema, table_name
             limit ?
             ",
         )
+        .bind(&database)
         .bind(MAX_EDITOR_TABLES + 1)
         .fetch_all(&pool)
         .await
@@ -770,8 +910,8 @@ async fn fetch_query_editor_metadata_for_connection(
         let mut truncated_columns = false;
 
         for row in table_rows.into_iter().take(MAX_EDITOR_TABLES as usize) {
-            let schema: String = mysql_get_idx(&row, 0, "table_schema", "get_query_editor_metadata")?;
-            let name: String = mysql_get_idx(&row, 1, "table_name", "get_query_editor_metadata")?;
+            let schema: String = mysql_get_string(&row, 0, "table_schema", "get_query_editor_metadata")?;
+            let name: String = mysql_get_string(&row, 1, "table_name", "get_query_editor_metadata")?;
             let column_rows = sqlx::query(
                 "
                 select column_name, data_type
@@ -793,8 +933,8 @@ async fn fetch_query_editor_metadata_for_connection(
             let mut columns = Vec::new();
             for column in column_rows.into_iter().take(MAX_EDITOR_COLUMNS_PER_TABLE as usize) {
                 columns.push(QueryEditorColumn {
-                    name: mysql_get_idx(&column, 0, "column_name", "get_query_editor_metadata")?,
-                    data_type: mysql_get_idx(&column, 1, "data_type", "get_query_editor_metadata")?,
+                    name: mysql_get_string(&column, 0, "column_name", "get_query_editor_metadata")?,
+                    data_type: mysql_get_string(&column, 1, "data_type", "get_query_editor_metadata")?,
                 });
             }
             tables.push(QueryEditorTable { schema, name, columns });
@@ -875,7 +1015,7 @@ async fn fetch_query_editor_metadata_for_connection(
                 &[&(MAX_EDITOR_TABLES + 1)],
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| map_pg_err(error, None))?;
 
         let truncated_tables = table_rows.len() as i64 > MAX_EDITOR_TABLES;
         let table_rows = if truncated_tables {
@@ -911,7 +1051,7 @@ async fn fetch_query_editor_metadata_for_connection(
                     &[&schema, &name, &(MAX_EDITOR_COLUMNS_PER_TABLE + 1)],
                 )
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| map_pg_err(error, None))?;
 
             let columns_exceeded = column_rows.len() as i64 > MAX_EDITOR_COLUMNS_PER_TABLE;
             if columns_exceeded {
@@ -950,7 +1090,7 @@ async fn fetch_query_editor_metadata_for_connection(
                 &[&(MAX_EDITOR_FUNCTIONS + 1)],
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| map_pg_err(error, None))?;
 
         let truncated_functions = function_rows.len() as i64 > MAX_EDITOR_FUNCTIONS;
         let functions = function_rows
@@ -1015,12 +1155,12 @@ async fn fetch_foreign_keys_for_connection(
         let mut edges = Vec::new();
         for row in rows {
             edges.push(ForeignKeyEdge {
-                from_schema: mysql_get_idx(&row, 0, "from_schema", "get_foreign_keys")?,
-                from_table: mysql_get_idx(&row, 1, "from_table", "get_foreign_keys")?,
-                from_column: mysql_get_idx(&row, 2, "from_column", "get_foreign_keys")?,
-                to_schema: mysql_get_idx(&row, 3, "to_schema", "get_foreign_keys")?,
-                to_table: mysql_get_idx(&row, 4, "to_table", "get_foreign_keys")?,
-                to_column: mysql_get_idx(&row, 5, "to_column", "get_foreign_keys")?,
+                from_schema: mysql_get_string(&row, 0, "from_schema", "get_foreign_keys")?,
+                from_table: mysql_get_string(&row, 1, "from_table", "get_foreign_keys")?,
+                from_column: mysql_get_string(&row, 2, "from_column", "get_foreign_keys")?,
+                to_schema: mysql_get_string(&row, 3, "to_schema", "get_foreign_keys")?,
+                to_table: mysql_get_string(&row, 4, "to_table", "get_foreign_keys")?,
+                to_column: mysql_get_string(&row, 5, "to_column", "get_foreign_keys")?,
             });
         }
         return Ok(edges);
@@ -1200,16 +1340,21 @@ pub async fn get_query_editor_metadata(
 
     if engine == DatabaseEngine::Mysql {
         let pool = get_or_create_mysql_pool(&app, &state, &connection_id).await?;
+        let database = load_connection(&app, &connection_id)?
+            .map(|connection| connection.database)
+            .unwrap_or_default();
         let table_rows = sqlx::query(
             "
             select table_schema, table_name
             from information_schema.tables
             where table_type = 'BASE TABLE'
+              and table_schema = ?
               and table_schema not in ('information_schema', 'mysql', 'performance_schema', 'sys')
             order by table_schema, table_name
             limit ?
             ",
         )
+        .bind(&database)
         .bind(MAX_EDITOR_TABLES + 1)
         .fetch_all(&pool)
         .await
@@ -1220,8 +1365,8 @@ pub async fn get_query_editor_metadata(
         let mut truncated_columns = false;
 
         for row in table_rows.into_iter().take(MAX_EDITOR_TABLES as usize) {
-            let schema: String = mysql_get_idx(&row, 0, "table_schema", "get_query_editor_metadata")?;
-            let name: String = mysql_get_idx(&row, 1, "table_name", "get_query_editor_metadata")?;
+            let schema: String = mysql_get_string(&row, 0, "table_schema", "get_query_editor_metadata")?;
+            let name: String = mysql_get_string(&row, 1, "table_name", "get_query_editor_metadata")?;
             let column_rows = sqlx::query(
                 "
                 select column_name, data_type
@@ -1243,8 +1388,8 @@ pub async fn get_query_editor_metadata(
             let mut columns = Vec::new();
             for column in column_rows.into_iter().take(MAX_EDITOR_COLUMNS_PER_TABLE as usize) {
                 columns.push(QueryEditorColumn {
-                    name: mysql_get_idx(&column, 0, "column_name", "get_query_editor_metadata")?,
-                    data_type: mysql_get_idx(&column, 1, "data_type", "get_query_editor_metadata")?,
+                    name: mysql_get_string(&column, 0, "column_name", "get_query_editor_metadata")?,
+                    data_type: mysql_get_string(&column, 1, "data_type", "get_query_editor_metadata")?,
                 });
             }
             tables.push(QueryEditorTable { schema, name, columns });
@@ -1325,7 +1470,7 @@ pub async fn get_query_editor_metadata(
                 &[&(MAX_EDITOR_TABLES + 1)],
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| map_pg_err(error, None))?;
 
         let truncated_tables = table_rows.len() as i64 > MAX_EDITOR_TABLES;
         let table_rows = if truncated_tables {
@@ -1361,7 +1506,7 @@ pub async fn get_query_editor_metadata(
                     &[&schema, &name, &(MAX_EDITOR_COLUMNS_PER_TABLE + 1)],
                 )
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| map_pg_err(error, None))?;
 
             let columns_exceeded = column_rows.len() as i64 > MAX_EDITOR_COLUMNS_PER_TABLE;
             if columns_exceeded {
@@ -1400,7 +1545,7 @@ pub async fn get_query_editor_metadata(
                 &[&(MAX_EDITOR_FUNCTIONS + 1)],
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| map_pg_err(error, None))?;
 
         let truncated_functions = function_rows.len() as i64 > MAX_EDITOR_FUNCTIONS;
         let functions = function_rows
@@ -1764,6 +1909,198 @@ fn parse_chat_message(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+type ParsedAskVeloxyChat = (
+    String,
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+    bool,
+    bool,
+);
+
+fn parse_ask_veloxy_chat_content(message_content: &str) -> ParsedAskVeloxyChat {
+    match parse_ask_veloxy_chat_json(message_content) {
+        Ok(value) => {
+            let message =
+                parse_chat_message(&value).unwrap_or_else(|| message_content.trim().to_string());
+            let mut draft = value
+                .get("sqlDraft")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("sql_draft").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string);
+            if draft.is_none() {
+                draft = extract_sql_draft_from_text(&message);
+            }
+            let suggestions = value
+                .get("suggestions")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .take(5)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let warnings = value
+                .get("warnings")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let needs_sql_generation = parse_bool_field(&value, "needsSqlGeneration", draft.is_some());
+            let needs_clarification = parse_bool_field(&value, "needsClarification", false);
+            (
+                message,
+                suggestions,
+                warnings,
+                draft,
+                needs_sql_generation,
+                needs_clarification,
+            )
+        }
+        Err(_) => {
+            let normalized_message = extract_message_from_loose_json(message_content)
+                .unwrap_or_else(|| message_content.trim().to_string());
+            let draft = extract_sql_draft_from_text(&normalized_message);
+            let needs_sql_generation = draft.is_some();
+            (
+                normalized_message,
+                Vec::new(),
+                vec!["Model returned non-JSON chat output. Parsed in tolerant mode.".to_string()],
+                draft,
+                needs_sql_generation,
+                false,
+            )
+        }
+    }
+}
+
+fn extract_openrouter_stream_delta(data: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(data).ok()?;
+    payload
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn emit_veloxy_stream_chunk(app: &AppHandle, chunk: VeloxyStreamChunk) {
+    let _ = app.emit("veloxy-stream-chunk", chunk);
+}
+
+async fn stream_openrouter_chat_completion(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    request_id: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
+    let response = client
+        .post(endpoint)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": model,
+            "temperature": 0.2,
+            "max_tokens": 700,
+            "stream": true,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt }
+            ]
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("OpenRouter request failed: {}", error))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown OpenRouter error".to_string());
+        if let Ok(payload) = serde_json::from_str::<Value>(&body) {
+            let message = payload
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown OpenRouter error");
+            return Err(format!("OpenRouter error ({}): {}", status.as_u16(), message));
+        }
+        return Err(format!("OpenRouter error ({}): {}", status.as_u16(), body));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut accumulated = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(accumulated);
+        }
+        let bytes = chunk.map_err(|error| format!("OpenRouter stream read failed: {}", error))?;
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(line_end) = buffer.find('\n') {
+            let line = buffer[..line_end].trim_end_matches('\r').to_string();
+            buffer.drain(..=line_end);
+
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let data = line["data: ".len()..].trim();
+            if data == "[DONE]" {
+                continue;
+            }
+            if let Some(delta) = extract_openrouter_stream_delta(data) {
+                accumulated.push_str(&delta);
+                emit_veloxy_stream_chunk(
+                    app,
+                    VeloxyStreamChunk {
+                        request_id: request_id.to_string(),
+                        delta,
+                        done: false,
+                        message: None,
+                        suggestions: Vec::new(),
+                        warnings: Vec::new(),
+                        sql_draft: None,
+                        needs_sql_generation: false,
+                        needs_clarification: false,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(accumulated)
+}
+
+#[tauri::command]
+pub async fn cancel_veloxy_request(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(cancel) = state.veloxy_cancel.read().await.as_ref() {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn chat_with_db(
     app: AppHandle,
@@ -1820,103 +2157,57 @@ pub async fn chat_with_db(
     let base_url = normalize_openrouter_base(input.provider_config.base_url.as_deref());
     let endpoint = format!("{}/chat/completions", base_url);
     let client = state.openrouter_client.get_or_init(reqwest::Client::new);
-    let response = client
-        .post(&endpoint)
-        .header("Authorization", format!("Bearer {}", input.provider_config.api_key.trim()))
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": input.provider_config.model.trim(),
-            "temperature": 0.2,
-            "max_tokens": 700,
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": user_prompt }
-            ]
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("OpenRouter request failed: {}", error))?;
+    let request_id = input
+        .request_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("req-{}", uuid::Uuid::new_v4()));
 
-    let status = response.status();
-    let payload = response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("Invalid OpenRouter JSON response: {}", error))?;
-    if !status.is_success() {
-        let message = payload
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("Unknown OpenRouter error");
-        return Err(format!("OpenRouter error ({}): {}", status.as_u16(), message));
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut guard = state.veloxy_cancel.write().await;
+        *guard = Some(cancel.clone());
     }
 
-    let message_content = extract_openrouter_message_content(&payload)?;
-    let (message, suggestions, warnings, sql_draft, needs_sql_generation, needs_clarification) =
-        match parse_ask_veloxy_chat_json(&message_content) {
-            Ok(value) => {
-                let message = parse_chat_message(&value).unwrap_or_else(|| message_content.trim().to_string());
-                let mut draft = value
-                    .get("sqlDraft")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.get("sql_draft").and_then(Value::as_str))
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .map(str::to_string);
-                if draft.is_none() {
-                    draft = extract_sql_draft_from_text(&message);
-                }
-                let suggestions = value
-                    .get("suggestions")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::trim)
-                            .filter(|text| !text.is_empty())
-                            .take(5)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let warnings = value
-                    .get("warnings")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let needs_sql_generation = parse_bool_field(&value, "needsSqlGeneration", draft.is_some());
-                let needs_clarification = parse_bool_field(&value, "needsClarification", false);
-                (
-                    message,
-                    suggestions,
-                    warnings,
-                    draft,
-                    needs_sql_generation,
-                    needs_clarification,
-                )
-            }
-            Err(_) => {
-                let normalized_message = extract_message_from_loose_json(&message_content)
-                    .unwrap_or_else(|| message_content.trim().to_string());
-                let draft = extract_sql_draft_from_text(&normalized_message);
-                let needs_sql_generation = draft.is_some();
-                (
-                    normalized_message,
-                    Vec::new(),
-                    vec!["Model returned non-JSON chat output. Parsed in tolerant mode.".to_string()],
-                    draft,
-                    needs_sql_generation,
-                    false,
-                )
-            }
-        };
+    let message_content = stream_openrouter_chat_completion(
+        &app,
+        client,
+        &endpoint,
+        input.provider_config.api_key.trim(),
+        input.provider_config.model.trim(),
+        system_prompt,
+        &user_prompt,
+        &request_id,
+        cancel.clone(),
+    )
+    .await?;
+
+    {
+        let mut guard = state.veloxy_cancel.write().await;
+        *guard = None;
+    }
+
+    let (message, suggestions, mut warnings, sql_draft, needs_sql_generation, needs_clarification) =
+        parse_ask_veloxy_chat_content(&message_content);
+
+    if cancel.load(Ordering::Relaxed) {
+        warnings.push("Stopped early.".to_string());
+    }
+
+    emit_veloxy_stream_chunk(
+        &app,
+        VeloxyStreamChunk {
+            request_id: request_id.clone(),
+            delta: String::new(),
+            done: true,
+            message: Some(message.clone()),
+            suggestions: suggestions.clone(),
+            warnings: warnings.clone(),
+            sql_draft: sql_draft.clone(),
+            needs_sql_generation,
+            needs_clarification,
+        },
+    );
 
     {
         let mut conversations = state.ask_veloxy_conversations.write().await;
@@ -2148,9 +2439,11 @@ pub async fn lint_sql(
                 let diagnostics = match client.simple_query(&lint_sql).await {
                     Ok(_) => Vec::new(),
                     Err(error) => {
-                        let (line, column) = lint_error_range(&error, &sql);
+                        let (line, column) = error_line_column(&error, &sql)
+                            .map(|(l, c)| (Some(l), Some(c)))
+                            .unwrap_or((None, None));
                         vec![SqlDiagnostic {
-                            message: error.to_string(),
+                            message: map_pg_err(error, Some(sql.as_str())),
                             severity: "error".to_string(),
                             line,
                             column,
@@ -2221,7 +2514,7 @@ pub async fn get_tables(
                         &[],
                     )
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| map_pg_err(error, None))?;
 
                 Ok(rows
                     .into_iter()
@@ -2246,22 +2539,27 @@ pub async fn get_tables(
         }
         DatabaseEngine::Mysql => {
             let pool = get_or_create_mysql_pool(&app, &state, &connection_id).await?;
+            let database = load_connection(&app, &connection_id)?
+                .map(|connection| connection.database)
+                .unwrap_or_default();
             let rows = sqlx::query(
                 "
                 select table_schema, table_name
                 from information_schema.tables
                 where table_type = 'BASE TABLE'
+                  and table_schema = ?
                   and table_schema not in ('information_schema', 'mysql', 'performance_schema', 'sys')
                 order by table_schema, table_name
                 ",
             )
+            .bind(&database)
             .fetch_all(&pool)
             .await
             .map_err(|error| error.to_string())?;
             let mut tables = Vec::new();
             for row in rows {
-                let schema: String = mysql_get_idx(&row, 0, "table_schema", "get_tables")?;
-                let name: String = mysql_get_idx(&row, 1, "table_name", "get_tables")?;
+                let schema: String = mysql_get_string(&row, 0, "table_schema", "get_tables")?;
+                let name: String = mysql_get_string(&row, 1, "table_name", "get_tables")?;
                 tables.push(TableInfo {
                     preview_query: format!("select * from `{}`.`{}` limit 100;", schema, name),
                     schema,
@@ -2326,7 +2624,7 @@ pub async fn get_schema(
                             &[&input.table_schema, &input.table_name],
                         )
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| map_pg_err(error, None))?;
 
                     Ok(rows
                         .into_iter()
@@ -2360,11 +2658,11 @@ pub async fn get_schema(
             let mut columns = Vec::new();
             for row in rows {
                 columns.push(ColumnInfo {
-                    table_schema: mysql_get_idx(&row, 0, "table_schema", "get_schema")?,
-                    table_name: mysql_get_idx(&row, 1, "table_name", "get_schema")?,
-                    column_name: mysql_get_idx(&row, 2, "column_name", "get_schema")?,
-                    data_type: mysql_get_idx(&row, 3, "data_type", "get_schema")?,
-                    is_nullable: mysql_get_idx::<String>(&row, 4, "is_nullable", "get_schema")? == "YES",
+                    table_schema: mysql_get_string(&row, 0, "table_schema", "get_schema")?,
+                    table_name: mysql_get_string(&row, 1, "table_name", "get_schema")?,
+                    column_name: mysql_get_string(&row, 2, "column_name", "get_schema")?,
+                    data_type: mysql_get_string(&row, 3, "data_type", "get_schema")?,
+                    is_nullable: mysql_get_string(&row, 4, "is_nullable", "get_schema")? == "YES",
                 });
             }
             Ok(columns)
@@ -2455,7 +2753,7 @@ pub async fn get_table_properties(
         .map_err(|error| error.to_string())?;
         let pk_cols: HashSet<String> = pk_rows
             .into_iter()
-            .map(|row| mysql_get_idx::<String>(&row, 0, "column_name", "get_table_properties"))
+            .map(|row| mysql_get_string(&row, 0, "column_name", "get_table_properties"))
             .collect::<Result<HashSet<_>, _>>()?;
 
         let unique_rows = sqlx::query(
@@ -2475,11 +2773,11 @@ pub async fn get_table_properties(
         .map_err(|error| error.to_string())?;
         let mut unique_by_index: HashMap<String, Vec<String>> = HashMap::new();
         for row in unique_rows {
-            let index_name: String = mysql_get_idx(&row, 0, "index_name", "get_table_properties")?;
+            let index_name: String = mysql_get_string(&row, 0, "index_name", "get_table_properties")?;
             if index_name == "PRIMARY" {
                 continue;
             }
-            let column_name: String = mysql_get_idx(&row, 1, "column_name", "get_table_properties")?;
+            let column_name: String = mysql_get_string(&row, 1, "column_name", "get_table_properties")?;
             unique_by_index.entry(index_name).or_default().push(column_name);
         }
         let mut unique_cols: HashSet<String> = HashSet::new();
@@ -2497,22 +2795,22 @@ pub async fn get_table_properties(
 
         let mut properties = Vec::new();
         for row in rows {
-                let column_name: String = mysql_get_idx(&row, 2, "column_name", "get_table_properties")?;
+                let column_name: String = mysql_get_string(&row, 2, "column_name", "get_table_properties")?;
                 let is_primary_key = pk_cols.contains(&column_name);
                 let is_unique = is_primary_key || unique_cols.contains(&column_name);
                 let is_part_of_composite_unique = composite_unique_cols.contains(&column_name);
-                let extra: String = mysql_get_idx(&row, 6, "extra", "get_table_properties")?;
+                let extra: String = mysql_get_string(&row, 6, "extra", "get_table_properties")?;
                 let lower_extra = extra.to_lowercase();
                 properties.push(ColumnProperties {
-                    table_schema: mysql_get_idx(&row, 0, "table_schema", "get_table_properties")?,
-                    table_name: mysql_get_idx(&row, 1, "table_name", "get_table_properties")?,
+                    table_schema: mysql_get_string(&row, 0, "table_schema", "get_table_properties")?,
+                    table_name: mysql_get_string(&row, 1, "table_name", "get_table_properties")?,
                     column_name,
-                    data_type: mysql_get_idx(&row, 3, "data_type", "get_table_properties")?,
-                    is_nullable: mysql_get_idx::<String>(&row, 4, "is_nullable", "get_table_properties")? == "YES",
+                    data_type: mysql_get_string(&row, 3, "data_type", "get_table_properties")?,
+                    is_nullable: mysql_get_string(&row, 4, "is_nullable", "get_table_properties")? == "YES",
                     is_primary_key,
                     is_unique,
                     is_part_of_composite_unique,
-                    column_default: mysql_get_idx::<Option<String>>(&row, 5, "column_default", "get_table_properties")?,
+                    column_default: mysql_get_optional_string(&row, 5, "column_default", "get_table_properties")?,
                     is_identity: lower_extra.contains("auto_increment"),
                     identity_generation: if lower_extra.contains("auto_increment") {
                         Some("BY DEFAULT".to_string())
@@ -2618,7 +2916,7 @@ pub async fn get_table_properties(
             &[&input.table_schema, &input.table_name],
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| map_pg_err(error, None))?;
 
     let primary_keys = client
         .query(
@@ -2636,7 +2934,7 @@ pub async fn get_table_properties(
             &[&input.table_schema, &input.table_name],
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| map_pg_err(error, None))?;
 
     let primary_key_columns: HashSet<String> = primary_keys
         .into_iter()
@@ -2659,7 +2957,7 @@ pub async fn get_table_properties(
             &[&input.table_schema, &input.table_name],
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| map_pg_err(error, None))?;
 
     let mut unique_by_name: HashMap<String, Vec<String>> = HashMap::new();
     for row in unique_constraints {
@@ -2752,7 +3050,7 @@ pub async fn apply_table_properties(
             &[&table_schema, &table_name],
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| map_pg_err(error, None))?;
 
     let mut current_nullable: HashMap<String, bool> = HashMap::new();
     for row in current_columns {
@@ -2776,7 +3074,7 @@ pub async fn apply_table_properties(
             &[&table_schema, &table_name],
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| map_pg_err(error, None))?;
 
     let primary_key_columns: HashSet<String> = primary_keys
         .into_iter()
@@ -2799,7 +3097,7 @@ pub async fn apply_table_properties(
             &[&table_schema, &table_name],
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| map_pg_err(error, None))?;
 
     let mut unique_by_name: HashMap<String, Vec<String>> = HashMap::new();
     for row in unique_constraints {
@@ -2830,7 +3128,7 @@ pub async fn apply_table_properties(
         desired_by_column.insert(update.column_name, (update.is_nullable, update.is_unique));
     }
 
-    let txn = client.transaction().await.map_err(|error| error.to_string())?;
+    let txn = client.transaction().await.map_err(|error| map_pg_err(error, None))?;
 
     // 1) Nullable changes
     for (column_name, (desired_is_nullable, _desired_is_unique)) in &desired_by_column {
@@ -2855,13 +3153,13 @@ pub async fn apply_table_properties(
                 "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL",
                 qualified_table, qualified_column
             );
-            txn.execute(sql.as_str(), &[]).await.map_err(|error| error.to_string())?;
+            txn.execute(sql.as_str(), &[]).await.map_err(|error| map_pg_err(error, Some(sql.as_str())))?;
         } else {
             let sql = format!(
                 "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL",
                 qualified_table, qualified_column
             );
-            txn.execute(sql.as_str(), &[]).await.map_err(|error| error.to_string())?;
+            txn.execute(sql.as_str(), &[]).await.map_err(|error| map_pg_err(error, Some(sql.as_str())))?;
         }
     }
 
@@ -2929,7 +3227,7 @@ pub async fn apply_table_properties(
                 quote_identifier(&generated_name),
                 qualified_column
             );
-            txn.execute(sql.as_str(), &[]).await.map_err(|error| error.to_string())?;
+            txn.execute(sql.as_str(), &[]).await.map_err(|error| map_pg_err(error, Some(sql.as_str())))?;
         } else {
             // Drop the existing single-column UNIQUE constraints for this column.
             let constraint_names = single_unique_constraint_names_by_column
@@ -2943,12 +3241,12 @@ pub async fn apply_table_properties(
                     qualified_table,
                     quote_identifier(&constraint_name)
                 );
-                txn.execute(sql.as_str(), &[]).await.map_err(|error| error.to_string())?;
+                txn.execute(sql.as_str(), &[]).await.map_err(|error| map_pg_err(error, Some(sql.as_str())))?;
             }
         }
     }
 
-        txn.commit().await.map_err(|error| error.to_string())?;
+        txn.commit().await.map_err(|error| map_pg_err(error, None))?;
         Ok(())
     })
     .await
@@ -2986,12 +3284,12 @@ pub async fn get_foreign_keys(
         let mut edges = Vec::new();
         for row in rows {
             edges.push(ForeignKeyEdge {
-                from_schema: mysql_get_idx(&row, 0, "from_schema", "get_foreign_keys")?,
-                from_table: mysql_get_idx(&row, 1, "from_table", "get_foreign_keys")?,
-                from_column: mysql_get_idx(&row, 2, "from_column", "get_foreign_keys")?,
-                to_schema: mysql_get_idx(&row, 3, "to_schema", "get_foreign_keys")?,
-                to_table: mysql_get_idx(&row, 4, "to_table", "get_foreign_keys")?,
-                to_column: mysql_get_idx(&row, 5, "to_column", "get_foreign_keys")?,
+                from_schema: mysql_get_string(&row, 0, "from_schema", "get_foreign_keys")?,
+                from_table: mysql_get_string(&row, 1, "from_table", "get_foreign_keys")?,
+                from_column: mysql_get_string(&row, 2, "from_column", "get_foreign_keys")?,
+                to_schema: mysql_get_string(&row, 3, "to_schema", "get_foreign_keys")?,
+                to_table: mysql_get_string(&row, 4, "to_table", "get_foreign_keys")?,
+                to_column: mysql_get_string(&row, 5, "to_column", "get_foreign_keys")?,
             });
         }
         return Ok(edges);
@@ -3131,15 +3429,15 @@ pub async fn get_table_indexes(
         let mut indexes = Vec::new();
         for row in rows.into_iter().take(MAX_TABLE_INDEX_ROWS as usize) {
             indexes.push(IndexInfo {
-                index_schema: mysql_get_idx(&row, 0, "index_schema", "get_table_indexes")?,
-                index_name: mysql_get_idx(&row, 1, "index_name", "get_table_indexes")?,
-                table_schema: mysql_get_idx(&row, 2, "table_schema", "get_table_indexes")?,
-                table_name: mysql_get_idx(&row, 3, "table_name", "get_table_indexes")?,
+                index_schema: mysql_get_string(&row, 0, "index_schema", "get_table_indexes")?,
+                index_name: mysql_get_string(&row, 1, "index_name", "get_table_indexes")?,
+                table_schema: mysql_get_string(&row, 2, "table_schema", "get_table_indexes")?,
+                table_name: mysql_get_string(&row, 3, "table_name", "get_table_indexes")?,
                 is_unique: mysql_get_idx(&row, 4, "is_unique", "get_table_indexes")?,
                 is_primary: mysql_get_idx(&row, 5, "is_primary", "get_table_indexes")?,
                 is_valid: true,
                 is_partial: false,
-                definition: mysql_get_idx(&row, 8, "definition", "get_table_indexes")?,
+                definition: mysql_get_string(&row, 8, "definition", "get_table_indexes")?,
                 index_bytes: 0,
                 idx_scan: 0,
                 idx_tup_read: 0,
@@ -3287,13 +3585,13 @@ pub async fn execute_ddl_transaction(
                     return Err("No SQL statements to execute.".to_string());
                 }
 
-                let txn = client.transaction().await.map_err(|error| error.to_string())?;
+                let txn = client.transaction().await.map_err(|error| map_pg_err(error, None))?;
                 for sql in &stmts {
                     txn.execute(sql.as_str(), &[])
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| map_pg_err(error, Some(sql.as_str())))?;
                 }
-                txn.commit().await.map_err(|error| error.to_string())?;
+                txn.commit().await.map_err(|error| map_pg_err(error, None))?;
                 Ok(())
             })
             .await
@@ -3352,7 +3650,7 @@ pub async fn execute_ddl_statement(
                 client
                     .execute(sql.as_str(), &[])
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| map_pg_err(error, Some(sql.as_str())))?;
                 Ok(())
             })
             .await
@@ -3422,10 +3720,44 @@ pub async fn save_text_file(content: String, output_path: String) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_schema_context, classify_sql_intent, mysql_decode_error, parse_ask_veloxy_json,
-        sqlite_decode_error, validate_generated_sql,
+        build_schema_context, classify_sql_intent, database_name_from_mysql_value,
+        decode_mysql_bytes_as_string, extract_openrouter_stream_delta, mysql_decode_error,
+        parse_ask_veloxy_json, sqlite_decode_error, validate_generated_sql,
     };
-    use crate::models::{QueryEditorColumn, QueryEditorMetadata, QueryEditorTable};
+    use crate::models::{
+        AskVeloxyDbContextCache, DatabaseEngine, QueryEditorColumn, QueryEditorMetadata,
+        QueryEditorTable,
+    };
+
+    #[test]
+    fn extract_openrouter_stream_delta_reads_content() {
+        let data = r#"{"choices":[{"delta":{"content":"Hello"}}]}"#;
+        assert_eq!(
+            extract_openrouter_stream_delta(data).as_deref(),
+            Some("Hello")
+        );
+    }
+
+    #[test]
+    fn database_name_from_mysql_value_rejects_empty() {
+        assert!(database_name_from_mysql_value(None, "list_databases").is_err());
+        assert!(database_name_from_mysql_value(Some(String::new()), "list_databases").is_err());
+    }
+
+    #[test]
+    fn database_name_from_mysql_value_accepts_non_empty() {
+        let name =
+            database_name_from_mysql_value(Some("my_app".to_string()), "list_databases").expect("name");
+        assert_eq!(name, "my_app");
+    }
+
+    #[test]
+    fn decode_mysql_bytes_as_string_uses_utf8_text() {
+        assert_eq!(
+            decode_mysql_bytes_as_string(b"my_schema"),
+            "my_schema"
+        );
+    }
 
     #[test]
     fn mysql_decode_error_is_explicit() {
@@ -3465,8 +3797,14 @@ mod tests {
             truncated_columns: false,
             truncated_functions: false,
         };
+        let db_context = AskVeloxyDbContextCache {
+            database_name: "test".to_string(),
+            engine: DatabaseEngine::Postgres,
+            metadata,
+            foreign_keys: Vec::new(),
+        };
 
-        let context = build_schema_context(&metadata, "show events", None);
+        let context = build_schema_context(&db_context, "show events", None);
         assert!(!context.is_empty());
         assert!(context.len() <= super::ASK_VELOXY_SCHEMA_CHAR_BUDGET);
     }
